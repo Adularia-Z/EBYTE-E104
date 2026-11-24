@@ -388,7 +388,10 @@ namespace E104
                 RowCount = RowCount + 1;
             }
             Label lb = c as Label;
-            if (lb != null) { lb.AutoSize = true; c.Anchor = AnchorStyles.Left | AnchorStyles.Right; }
+            if (lb != null) lb.AutoSize = true;
+            // 跨列块(如 2x2 选项)用 Fill 撑满单元格,获得真实宽度 → 子项可据此自适应
+            if (colSpan > 1) c.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top;
+            else c.Anchor = lb != null ? (AnchorStyles.Left | AnchorStyles.Right) : (AnchorStyles.Left | AnchorStyles.Top);
             c.Margin = new Padding(col == 0 ? 8 : 4, 3, 6, 3);
             Controls.Add(c, col, row);
             if (colSpan > 1) SetColumnSpan(c, colSpan);

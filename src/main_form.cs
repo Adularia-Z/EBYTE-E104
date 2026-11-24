@@ -1590,22 +1590,36 @@ namespace E104
             int[] bits = new int[] { 1, 2, 4, 8 };
 
             // 选项 2x2 放进块容器,块本身占网格前两列并跨两行
+            // 关键:块与子项宽度都按"单元格实际宽度"自适应,窄窗口时等比收缩,绝不被裁切
             Panel optBlock = new Panel();
             optBlock.BackColor = Color.Transparent;
-            optBlock.Width = 360; optBlock.Height = 56;
+            optBlock.Width = 360;
+            optBlock.Height = 56;
+            DarkCheck[] blockCks = new DarkCheck[4];
             for (int i = 0; i < 4; i++)
             {
                 DarkCheck ck = new DarkCheck();
                 ck.Text = names[i] + " (" + bits[i] + ")";
                 FitDark(ck);
                 DarkTips.Set(ck, Tips["PHY"]);
-                ck.Left = (i % 2) * 180;
-                ck.Top = (i / 2) * 28;
-                ck.Width = 176;
                 ck.Height = 24;
                 optBlock.Controls.Add(ck);
+                blockCks[i] = ck;
                 phyChecks[i] = ck;
             }
+            // 重新排布块内 2x2:每格宽 = 块宽/2,文字过长由自绘 EndEllipsis 收尾
+            EventHandler layBlock = delegate
+            {
+                int half = Math.Max(90, optBlock.ClientSize.Width / 2);
+                for (int i = 0; i < 4; i++)
+                {
+                    blockCks[i].Left = (i % 2) * half;
+                    blockCks[i].Top = (i / 2) * 28;
+                    blockCks[i].Width = Math.Max(80, half - 4);
+                }
+            };
+            optBlock.Resize += delegate { layBlock(null, null); };
+            layBlock(null, null);
 
             phySumLbl = new Label();
             phySumLbl.ForeColor = Theme.AccentHi; phySumLbl.AutoSize = true; phySumLbl.Text = "参数 = 1";
