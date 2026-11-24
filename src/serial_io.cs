@@ -164,6 +164,12 @@ namespace E104
         private static readonly Regex ReKv = new Regex(@"^\+([A-Za-z_0-9]+)=(.*)$", RegexOptions.Compiled);
         private static readonly Regex ReScanRow = new Regex(@"^(\d+)\s+([0-9A-F:]{17})\s+(-?\d+)[ \t]*(.*)$", RegexOptions.Compiled);
         private static readonly Regex RePrompt = new Regex(@"^INPUT (?:EXT ADV|BLE DATA):(\d+)$", RegexOptions.Compiled);
+        // "+RECEIVED:<handle>,<len>"
+        private static readonly Regex ReReceived = new Regex(@"^\+RECEIVED:\s*(\d+)\s*,\s*(\d+)\s*$", RegexOptions.Compiled);
+
+        // BLE 数据三行协议的中间状态
+        private bool _rxPending = false;
+        private string _rxHandle = "", _rxLen = "";
 
         private static readonly string[] EventWords = new string[]
         { "CONNECTD", "CONNECTED", "DISCONNECTED", "DISCONNECT", "RECEIVE TIMEOUT", "MODULE POWERUP", "CONNECT TIMEOUT" };
@@ -273,10 +279,38 @@ namespace E104
 
             Match mp = RePrompt.Match(line);
             if (mp.Success) PendingInputNeeded = int.Parse(mp.Groups[1].Value);
-            if (line.StartsWith("+RECEIVED:", StringComparison.Ordinal))
+
+            // ---- BLE 数据接收三行协议(实测 7413-1-16) ----
+            //   第1行: +RECEIVED:<handle>,<len>
+            //   第2行: BLE DATA
+            //   第3行: <实际数据>            ← 必须与提示一起上报,否则用户看不到内容
+            if (_rxPending || line.StartsWith("+RECEIVED:", StringComparison.Ordinal))
             {
-                if (OnReceived != null) OnReceived(line);
+                Match mr = ReReceived.Match(line);
+                if (mr.Success)
+                {
+                    _rxPending = true;
+                    _rxHandle = mr.Groups[1].Value;
+                    _rxLen = mr.Groups[2].Value;
+                    if (OnLog != null) OnLog("rx", line);
+                    return;                        // 提示行已记录,等待正文
+                }
+                if (_rxPending && string.Equals(line, "BLE DATA", StringComparison.Ordinal))
+                {
+                    if (OnLog != null) OnLog("rx", line);   // 中间标记行
+                    return;                        // 继续等待真正的数据行
+                }
+                if (_rxPending)
+                {
+                    // 这一行就是数据正文:合并成一条完整记录上报
+                    _rxPending = false;
+                    string merged = "+RECEIVED:" + _rxHandle + "," + _rxLen + "  " + line;
+                    if (OnLog != null) OnLog("rx", "  ↳ " + line);
+                    if (OnReceived != null) OnReceived(merged);
+                    // 不 return:仍走下方等待器/状态回填逻辑
+                }
             }
+
             if (line.StartsWith("+ERR=", StringComparison.Ordinal))
             {
                 if (OnLog != null) OnLog("err", line);
@@ -289,7 +323,11 @@ namespace E104
             }
             else
             {
-                if (OnLog != null) OnLog("rx", line);
+                // +RECEIVED 提示行已在上面处理,避免重复打印
+                if (!line.StartsWith("+RECEIVED:", StringComparison.Ordinal))
+                {
+                    if (OnLog != null) OnLog("rx", line);
+                }
             }
 
             if (ScanActive)
