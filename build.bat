@@ -14,19 +14,23 @@ if not exist "%CSC%" (
     exit /b 1
 )
 
-echo [1/4] 编译主程序 => 智家伴蓝牙串口助手.exe
+echo [1/5] 编译主程序 => 智家伴蓝牙串口助手.exe
 %CSC% /nologo /target:winexe /codepage:65001 /optimize+ /out:"智家伴蓝牙串口助手.exe" program.cs ui_theme.cs serial_io.cs multi_device.cs main_form.cs pages_extra.cs pages_multi.cs /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll
 if errorlevel 1 goto :fail
 
-echo [2/4] 编译协议自检 => TestProto.exe (需模组)
+echo [2/5] 编译协议自检 => TestProto.exe (需模组)
 %CSC% /nologo /target:exe /codepage:65001 /out:"TestProto.exe" test_proto.cs serial_io.cs multi_device.cs /r:System.dll
 if errorlevel 1 goto :fail
 
-echo [3/4] 编译多机逻辑自检 => TestMulti.exe (无需硬件)
+echo [3/5] 编译多机逻辑自检 => TestMulti.exe (无需硬件)
 %CSC% /nologo /target:exe /codepage:65001 /out:"TestMulti.exe" test_multi.cs multi_device.cs serial_io.cs /r:System.dll
 if errorlevel 1 goto :fail
 
-echo [4/4] 编译双机互传验证 => TestDuplex.exe (需 COM3+COM4 两个模组)
+echo [4/5] 编译字节流离线验证 => TestProtoBytes.exe (无需硬件)
+%CSC% /nologo /target:exe /codepage:65001 /out:"TestProtoBytes.exe" tools\test_proto_bytes.cs serial_io.cs /r:System.dll
+if errorlevel 1 goto :fail
+
+echo [5/5] 编译双机互传验证 => TestDuplex.exe (需 COM3+COM4 两个模组)
 %CSC% /nologo /target:exe /codepage:65001 /out:"TestDuplex.exe" test_duplex.cs serial_io.cs multi_device.cs /r:System.dll
 if errorlevel 1 goto :fail
 
@@ -34,6 +38,7 @@ echo.
 echo ==================================================
 echo  构建完成:
 echo    智家伴蓝牙串口助手.exe   主程序
+echo    TestProtoBytes.exe       字节流离线验证(无需硬件)
 echo    TestProto.exe            AT 协议自检(单模组)
 echo    TestMulti.exe            多机分配逻辑自检(无硬件)
 echo    TestDuplex.exe           双机数据互传验证(双模组)

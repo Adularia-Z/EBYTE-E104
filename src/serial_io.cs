@@ -1,6 +1,9 @@
-// serial_io.cs — 串口引擎 + 协议会话层(C#5;.NET Framework 4.8 内置 System.IO.Ports)
-// 会话逻辑已在真机验证(Python 版),本文件为其等价移植:
-//   行组装 / 应答等待器(静默+超时) / 20ms 防粘连 / 交互式输入提示 / 流式路由 / 事件横幅 / 键值回填
+// serial_io.cs — 串口引擎 + 协议会话层(P0 重构版)
+// 关键设计:
+//   1) 字节流状态机:识别 +RECEIVED:<h>,<len> 后按声明长度消费原始字节,
+//      不再按 \n 切行 → 二进制载荷(含 00 / 0D 0A / FF)完整保真
+//   2) 指令队列:同一串口串行执行一条 AT 请求,按命令匹配应答,杜绝错配
+//   3) 两步发送(ADV_EXT / SEND)独占会话顺序,超时/错误/断开自动清理
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -22,18 +25,25 @@ namespace E104
         private readonly object _wlock = new object();
         private DateTime _lastWrite = DateTime.MinValue;
         public ConcurrentQueue<byte> RxQueue = new ConcurrentQueue<byte>();
-        public Action<string> OnError;              // 读线程异常(拔出等)
+        public Action<string> OnError;
 
         public bool IsOpen { get { return _open; } }
         public string PortName { get; private set; }
         public int Baud { get; private set; }
+        public const int MinFrameGapMs = 20;      // 最小帧间隔(手册 5.7 防粘连)
 
         public static string[] ListPorts()
         {
             string[] arr = SerialPort.GetPortNames();
             List<string> lst = new List<string>();
             foreach (string s in arr) if (s.StartsWith("COM", StringComparison.OrdinalIgnoreCase)) lst.Add(s.ToUpper());
-            lst.Sort(delegate(string a, string b) { return int.Parse(Regex.Replace(a, @"\D", "")).CompareTo(int.Parse(Regex.Replace(b, @"\D", ""))); });
+            lst.Sort(delegate(string a, string b)
+            {
+                int ia, ib;
+                int.TryParse(Regex.Replace(a, @"\D", ""), out ia);
+                int.TryParse(Regex.Replace(b, @"\D", ""), out ib);
+                return ia.CompareTo(ib);
+            });
             return lst.ToArray();
         }
 
@@ -51,7 +61,7 @@ namespace E104
             _open = true;
             _thr = new Thread(ReaderLoop);
             _thr.IsBackground = true;
-            _thr.Name = "serial-rx";
+            _thr.Name = "serial-rx-" + name;
             _thr.Start();
         }
 
@@ -62,9 +72,9 @@ namespace E104
             {
                 try
                 {
-                    if (!_sp.IsOpen) { Fail("串口已关闭"); return; }
+                    if (_sp == null || !_sp.IsOpen) { Fail("串口已关闭"); return; }
                     int n = _sp.BytesToRead;
-                    if (n <= 0) { Thread.Sleep(8); continue; }
+                    if (n <= 0) { Thread.Sleep(6); continue; }
                     if (n > buf.Length) n = buf.Length;
                     n = _sp.Read(buf, 0, n);
                     for (int i = 0; i < n; i++) RxQueue.Enqueue(buf[i]);
@@ -79,7 +89,6 @@ namespace E104
             if (OnError != null) OnError(msg);
         }
 
-        /// <summary>写裸字节(无间隔保护,用于交互式数据)</summary>
         public void WriteRaw(byte[] data)
         {
             lock (_wlock)
@@ -89,14 +98,14 @@ namespace E104
             }
         }
 
-        /// <summary>写 AT 指令:自动加 CRLF,防粘连最小 20ms 帧间隔(手册 5.7)</summary>
+        /// <summary>写 AT 指令:自动 CRLF + 最小帧间隔</summary>
         public void WriteCmd(string cmd)
         {
             lock (_wlock)
             {
                 if (!_open) throw new IOException("串口未打开");
                 double gap = (DateTime.UtcNow - _lastWrite).TotalMilliseconds;
-                if (gap < 20.0) Thread.Sleep((int)(20.0 - gap) + 1);
+                if (gap < MinFrameGapMs) Thread.Sleep((int)(MinFrameGapMs - gap) + 1);
                 _lastWrite = DateTime.UtcNow;
                 byte[] body = Encoding.ASCII.GetBytes(cmd);
                 byte[] frame = new byte[body.Length + 2];
@@ -106,75 +115,168 @@ namespace E104
             }
         }
 
-        /// <summary>RTS 拉低→拉高脉冲(模块 CTS 上升沿唤醒)</summary>
         public void RtsPulse(int times)
         {
             for (int i = 0; i < times; i++)
             {
-                _sp.RtsEnable = false;
-                Thread.Sleep(150);
-                _sp.RtsEnable = true;
-                Thread.Sleep(250);
+                try { _sp.RtsEnable = false; Thread.Sleep(150); _sp.RtsEnable = true; Thread.Sleep(250); }
+                catch { return; }
             }
         }
 
         public void Dispose()
         {
             _open = false;
-            try { if (_sp != null && _sp.IsOpen) { _sp.DiscardInBuffer(); _sp.Close(); } }
-            catch { }
+            try { if (_sp != null && _sp.IsOpen) { _sp.DiscardInBuffer(); _sp.Close(); } } catch { }
         }
     }
 
-    // ============ 协议会话 ============
-    public class CmdWaiter
+    // ============ 指令请求 ============
+    public class AtRequest
     {
-        public string CmdText;
-        public List<string> Lines = new List<string>();
-        public DateTime Deadline;
-        public DateTime LastRx;
-        public int QuietMs;
+        public string Cmd;                        // 原始指令
+        public string ExpectKey;                  // 期望的应答键(如 MAC / ROLE),空=任意
+        public Regex ExpectRe;                    // 期望应答正则(可为空)
+        public int TimeoutMs = 3000;
+        public int QuietMs = 120;
+        public DateTime Deadline = DateTime.MinValue;
+        public DateTime LastRx = DateTime.MinValue;
+        public readonly List<string> Lines = new List<string>();
         public Action<List<string>, bool> Cb;
+        public bool Sent = false;
+        public bool IsTwoStep = false;            // 两步发送占用会话
+        public int PendingLen = -1;               // 待输入字节数
+        public Action<byte[]> OnTwoStepInput;     // 输入提示回调
+        public DateTime TwoStepDeadline;
     }
 
+    // ============ 协议会话 ============
     public class Session
     {
         public SerialIo Io;
-        private readonly List<CmdWaiter> _waiters = new List<CmdWaiter>();
-        private readonly List<byte> _linebuf = new List<byte>();
+        private readonly object _qLock = new object();
+        private readonly Queue<AtRequest> _queue = new Queue<AtRequest>();
+        private AtRequest _current = null;         // 正在等待应答的请求
+        private readonly List<byte> _rx = new List<byte>();   // 原始字节缓冲
         public volatile bool ScanActive = false;
         public volatile bool ObserverActive = false;
-        public int PendingInputNeeded = -1;      // INPUT 提示后等待的字节数
-        public long TxCount, RxCount;
+        public int PendingInputNeeded = -1;
+        public long TxCount, RxCount, TxBytes, RxBytes;
 
-        // ---- 事件钩子(UI 都在此层之上) ----
-        public Action<string, string> OnLog;                       // tag,text
+        // ---- 事件钩子 ----
+        public Action<string, string> OnLog;                 // tag,text
         public Action<string> OnLastReply;
-        public Action<int> OnPrompt;                               // INPUT …:n
-        public Action<string> OnReceived;                          // +RECEIVED 行
-        public Action<int, string, string, string> OnScanRow;      // idx,mac,rssi,name
+        public Action<int> OnPrompt;                         // INPUT …:n
+        public Action<string> OnReceived;                    // 合并后的完整接收记录
+        public Action<byte[], int, int> OnReceivedBinary;    // 原始载荷,handle,len
+        public Action<int, string, string, string> OnScanRow;
         public Action<string> OnObserverLine;
         public Action<string> OnLinkEvent;
-        public Action<string, string> OnStateValue;               // key,value
+        public Action<string, string> OnStateValue;
         public Action<string> OnErrCode;
-        public Action<byte[]> OnRawRx;                             // 原始接收字节流(串口助手 HEX 视图)
-        public Action<byte[]> OnRawTx;                             // 原始发送字节帧
-        public long TxBytes, RxBytes;                              // 字节计数(串口助手风格)
+        public Action<byte[]> OnRawRx;
+        public Action<byte[]> OnRawTx;
 
-        private static readonly Regex ReKv = new Regex(@"^\+([A-Za-z_0-9]+)=(.*)$", RegexOptions.Compiled);
-        private static readonly Regex ReScanRow = new Regex(@"^(\d+)\s+([0-9A-F:]{17})\s+(-?\d+)[ \t]*(.*)$", RegexOptions.Compiled);
-        private static readonly Regex RePrompt = new Regex(@"^INPUT (?:EXT ADV|BLE DATA):(\d+)$", RegexOptions.Compiled);
-        // "+RECEIVED:<handle>,<len>"
-        private static readonly Regex ReReceived = new Regex(@"^\+RECEIVED:\s*(\d+)\s*,\s*(\d+)\s*$", RegexOptions.Compiled);
+        // ---- 数据接收状态机 ----
+        private enum RxState { Line, AfterReceivedHeader, AfterBleDataTag, Payload }
+        private RxState _st = RxState.Line;
+        private int _rxHandle = -1, _rxLen = -1;
+        private byte[] _payload = null;
+        private int _payloadGot = 0;
 
-        // BLE 数据三行协议的中间状态
-        private bool _rxPending = false;
-        private string _rxHandle = "", _rxLen = "";
+        private static readonly Regex ReReceivedHdr =
+            new Regex(@"^\+RECEIVED:\s*(\d+)\s*,\s*(\d+)\s*$", RegexOptions.Compiled);
+        private static readonly Regex ReKv =
+            new Regex(@"^\+([A-Za-z_0-9]+)\s*=\s*(.*)$", RegexOptions.Compiled);
+        private static readonly Regex ReErr = new Regex(@"^\+ERR\s*=\s*(\d+)", RegexOptions.Compiled);
+        private static readonly Regex RePrompt =
+            new Regex(@"^INPUT\s+(?:EXT ADV|BLE DATA)\s*:\s*(\d+)\s*$", RegexOptions.Compiled);
+        private static readonly Regex ReScanRow =
+            new Regex(@"^(\d+)\s+([0-9A-F]{2}(?::[0-9A-F]{2}){5})\s+(-?\d+)[ \t]*(.*)$", RegexOptions.Compiled);
 
-        private static readonly string[] EventWords = new string[]
-        { "CONNECTD", "CONNECTED", "DISCONNECTED", "DISCONNECT", "RECEIVE TIMEOUT", "MODULE POWERUP", "CONNECT TIMEOUT" };
+        private static readonly string[] EventWords =
+            { "MODULE POWERUP", "CONNECT TIMEOUT", "ALREADY CONNECTED" };
 
         public Session(SerialIo io) { Io = io; }
+
+        /// <summary>测试/回放用:直接注入接收字节(不经过真实串口)</summary>
+        public void InjectBytes(byte[] data)
+        {
+            for (int i = 0; i < data.Length; i++) Io.RxQueue.Enqueue(data[i]);
+        }
+
+        // ============================================================ 发送入口
+        /// <summary>所有 AT 请求的唯一入口:入队 → 串行执行</summary>
+        public AtRequest Query(string cmd, Action<List<string>, bool> cb, int timeoutMs, int quietMs)
+        {
+            AtRequest r = new AtRequest();
+            r.Cmd = cmd;
+            r.Cb = cb;
+            r.TimeoutMs = timeoutMs;
+            r.QuietMs = quietMs;
+            r.ExpectKey = ExtractKey(cmd);
+            lock (_qLock) { _queue.Enqueue(r); }
+            Pump();                    // 立刻尝试发送
+            return r;
+        }
+
+        private static string ExtractKey(string cmd)
+        {
+            // AT+MAC? → MAC ; AT+NAME=xx → NAME
+            Match m = Regex.Match(cmd ?? "", @"^AT\+([A-Za-z_0-9]+)");
+            return m.Success ? m.Groups[1].Value.ToUpperInvariant() : "";
+        }
+
+        /// <summary>两步发送:下发命令并进入等输入状态</summary>
+        public AtRequest QueryTwoStep(string cmd, Action<byte[]> onInput, int timeoutMs)
+        {
+            AtRequest r = new AtRequest();
+            r.Cmd = cmd;
+            r.ExpectKey = ExtractKey(cmd);
+            r.TimeoutMs = timeoutMs;
+            r.QuietMs = 150;
+            r.IsTwoStep = true;
+            r.OnTwoStepInput = onInput;
+            lock (_qLock) { _queue.Enqueue(r); }
+            Pump();
+            return r;
+        }
+
+        /// <summary>两步发送:写入原始载荷(不排队,独占)</summary>
+        public bool SendTwoStepPayload(byte[] data)
+        {
+            if (_current == null || !_current.IsTwoStep) return false;
+            if (_current.PendingLen < 0) return false;
+            try { Io.WriteRaw(data); }
+            catch (Exception ex)
+            {
+                // 回放/离线模式:无真实串口,仅记录
+                if (OnLog != null) OnLog("err", "写入失败: " + ex.Message);
+            }
+            TxCount++; TxBytes += data.Length;
+            if (OnRawTx != null) OnRawTx(data);
+            if (OnLog != null) OnLog("tx", "[数据] " + data.Length + " 字节");
+            _current.PendingLen = -1;              // 已提交,等待最终 +OK
+            _current.LastRx = DateTime.UtcNow;
+            return true;
+        }
+
+        public void SendRaw(byte[] data, string note)
+        {
+            Io.WriteRaw(data);
+            TxCount++; TxBytes += data.Length;
+            if (OnRawTx != null) OnRawTx(data);
+            if (OnLog != null)
+            {
+                bool pr = true;
+                foreach (byte b in data) if (b < 0x20 || b >= 0x7f) { pr = false; break; }
+                StringBuilder sb = new StringBuilder();
+                sb.Append("[") .Append(note).Append("] ").Append(data.Length).Append("字节: ");
+                if (pr) sb.Append(Encoding.ASCII.GetString(data));
+                else for (int i = 0; i < data.Length; i++) { if (i > 0) sb.Append(' '); sb.Append(data[i].ToString("X2")); }
+                OnLog("tx", sb.ToString());
+            }
+        }
 
         public void Send(string cmd)
         {
@@ -185,183 +287,272 @@ namespace E104
             if (OnLog != null) OnLog("tx", cmd + "\\r\\n");
         }
 
-        public void SendRaw(byte[] data, string note)
-        {
-            Io.WriteRaw(data);
-            TxCount++; TxBytes += data.Length;
-            if (OnRawTx != null) OnRawTx(data);
-            StringBuilder sb = new StringBuilder();
-            bool printable = true;
-            foreach (byte b in data) if (b < 0x20 || b >= 0x7f) { printable = false; break; }
-            sb.Append("[" + note + "] ").Append(data.Length).Append("字节: ");
-            if (printable) sb.Append(Encoding.ASCII.GetString(data)); else HexOf(data, sb);
-            if (OnLog != null) OnLog("tx", sb.ToString());
-        }
-        private static void HexOf(byte[] data, StringBuilder sb)
-        {
-            for (int i = 0; i < data.Length; i++) { if (i > 0) sb.Append(' '); sb.Append(data[i].ToString("X2")); }
-        }
-
-        public CmdWaiter Query(string cmd, Action<List<string>, bool> cb, int timeoutMs, int quietMs)
-        {
-            CmdWaiter w = new CmdWaiter();
-            w.CmdText = cmd; w.Cb = cb;
-            w.QuietMs = quietMs;
-            w.Deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
-            lock (_waiters) { _waiters.Add(w); }
-            Send(cmd);
-            return w;
-        }
-
-        /// <summary>由宿主定时器驱动(本方法须在宿主线程调用;UI=WinForms Timer 线程)</summary>
+        // ============================================================ 主循环
+        /// <summary>由宿主定时器驱动(UI 线程)</summary>
         public void Pump()
         {
-            // 原始字节流:整批取出后上报(串口助手 HEX 视图)
+            DranBytes();
+            ParseRx();
+            Settle();
+            PumpQueue();
+        }
+
+        private void DranBytes()
+        {
             byte b;
-            List<byte> drained = null;
+            List<byte> chunk = null;
             while (Io.RxQueue.TryDequeue(out b))
             {
                 RxCount++;
-                if (drained == null) drained = new List<byte>(256);
-                drained.Add(b);
-                _linebuf.Add(b);
+                if (chunk == null) chunk = new List<byte>(512);
+                chunk.Add(b);
+                _rx.Add(b);
             }
-            if (drained != null)
+            if (chunk != null)
             {
-                byte[] chunk = drained.ToArray();
-                RxBytes += chunk.Length;
-                if (OnRawRx != null) OnRawRx(chunk);
-            }
-            while (true)
-            {
-                int idx = _linebuf.IndexOf((byte)'\n');
-                if (idx < 0) break;
-                byte[] raw = new byte[idx];
-                _linebuf.CopyTo(0, raw, 0, idx);
-                _linebuf.RemoveRange(0, idx + 1);
-                int end = raw.Length; while (end > 0 && (raw[end - 1] == 13 || raw[end - 1] == 10)) end--;
-                if (end == 0) continue;
-                string line = Encoding.UTF8.GetString(raw, 0, end).Trim();
-                if (line.Length > 0) DispatchLine(line);
-            }
-            // 结算等待器
-            DateTime now = DateTime.UtcNow;
-            List<CmdWaiter> done = new List<CmdWaiter>();
-            lock (_waiters)
-            {
-                for (int i = 0; i < _waiters.Count; i++)
-                {
-                    CmdWaiter w = _waiters[i];
-                    bool got = w.Lines.Count > 0;
-                    bool idle = (now - w.LastRx).TotalMilliseconds >= w.QuietMs;
-                    if (got && idle && w.LastRx > DateTime.MinValue) done.Add(w);
-                    else if (now > w.Deadline) done.Add(w);
-                }
-                for (int i = 0; i < done.Count; i++) _waiters.Remove(done[i]);
-            }
-            for (int i = 0; i < done.Count; i++)
-            {
-                CmdWaiter w = done[i];
-                bool ok = w.Lines.Count > 0;
-                if (w.Cb != null)
-                {
-                    List<string> snap = new List<string>(w.Lines);
-                    try { w.Cb(snap, ok); } catch { }
-                }
+                byte[] arr = chunk.ToArray();
+                RxBytes += arr.Length;
+                if (OnRawRx != null) OnRawRx(arr);
             }
         }
 
-        public void DrainWaitForComplete() { }   // 兼容占位
+        // ============================================================ 字节流解析
+        private void ParseRx()
+        {
+            int guard = 0;
+            while (_rx.Count > 0 && guard++ < 20000)
+            {
+                if (_st == RxState.Payload)
+                {
+                    int need = _rxLen - _payloadGot;
+                    int take = Math.Min(need, _rx.Count);
+                    Array.Copy(_rx.ToArray(), 0, _payload, _payloadGot, take);
+                    _rx.RemoveRange(0, take);
+                    _payloadGot += take;
+                    if (_payloadGot >= _rxLen)
+                    {
+                        byte[] full = new byte[_rxLen];
+                        Array.Copy(_payload, full, _rxLen);
+                        EmitPayload(full, _rxHandle);
+                        _st = RxState.Line;
+                        _payload = null; _payloadGot = 0;
+                    }
+                    continue;
+                }
 
+                // 行模式:找 \n
+                int nl = _rx.IndexOf((byte)'\n');
+                if (nl < 0) break;
+                byte[] raw = new byte[nl];
+                _rx.CopyTo(0, raw, 0, nl);
+                _rx.RemoveRange(0, nl + 1);
+                int end = raw.Length;
+                while (end > 0 && (raw[end - 1] == 13 || raw[end - 1] == 10)) end--;
+                if (end == 0) continue;
+                string line = Encoding.UTF8.GetString(raw, 0, end).Trim();
+                if (line.Length == 0) continue;
+
+                if (_st == RxState.AfterReceivedHeader)
+                {
+                    Match mp = RePrompt.Match(line);
+                    if (mp.Success) { _st = RxState.Line; DispatchLine(line); continue; }
+                    if (string.Equals(line, "BLE DATA", StringComparison.Ordinal))
+                    { _st = RxState.Payload; _payloadGot = 0; continue; }
+                    // 不是标签:按纯文本数据处理(兼容无标签固件)
+                    EmitTextPayload(line, _rxHandle, _rxLen);
+                    _st = RxState.Line;
+                    continue;
+                }
+
+                Match mh = ReReceivedHdr.Match(line);
+                if (mh.Success)
+                {
+                    int h, l;
+                    int.TryParse(mh.Groups[1].Value, out h);
+                    int.TryParse(mh.Groups[2].Value, out l);
+                    _rxHandle = h; _rxLen = l;
+                    _payload = new byte[Math.Max(0, l)];
+                    _payloadGot = 0;
+                    if (OnLog != null) OnLog("rx", line);
+                    _st = l > 0 ? RxState.AfterReceivedHeader : RxState.Line;
+                    if (l == 0) EmitPayload(new byte[0], h);
+                    continue;
+                }
+
+                DispatchLine(line);
+            }
+        }
+
+        private void EmitPayload(byte[] data, int handle)
+        {
+            // 日志:文本安全则按文本,否则 HEX
+            bool printable = true;
+            foreach (byte b in data) if (b < 0x20 || b >= 0x7f) { printable = false; break; }
+            string shown = printable ? Encoding.ASCII.GetString(data)
+                                      : BitConverter.ToString(data).Replace("-", " ");
+            if (OnLog != null) OnLog("rx", "  ↳ [" + data.Length + "B] " + shown);
+            if (OnReceivedBinary != null) OnReceivedBinary(data, handle, data.Length);
+            if (OnReceived != null) OnReceived("+RECEIVED:" + handle + "," + data.Length + "  " + shown);
+        }
+
+        private void EmitTextPayload(string text, int handle, int declared)
+        {
+            if (OnLog != null) OnLog("rx", "  ↳ " + text);
+            byte[] b = Encoding.ASCII.GetBytes(text);
+            if (OnReceivedBinary != null) OnReceivedBinary(b, handle, declared);
+            if (OnReceived != null) OnReceived("+RECEIVED:" + handle + "," + declared + "  " + text);
+        }
+
+        // ============================================================ 行分发
         private void DispatchLine(string line)
         {
             if (OnLastReply != null) OnLastReply(line);
 
             Match mp = RePrompt.Match(line);
-            if (mp.Success) PendingInputNeeded = int.Parse(mp.Groups[1].Value);
-
-            // ---- BLE 数据接收三行协议(实测 7413-1-16) ----
-            //   第1行: +RECEIVED:<handle>,<len>
-            //   第2行: BLE DATA
-            //   第3行: <实际数据>            ← 必须与提示一起上报,否则用户看不到内容
-            if (_rxPending || line.StartsWith("+RECEIVED:", StringComparison.Ordinal))
+            if (mp.Success && _current != null)
             {
-                Match mr = ReReceived.Match(line);
-                if (mr.Success)
+                int need;
+                if (int.TryParse(mp.Groups[1].Value, out need))
                 {
-                    _rxPending = true;
-                    _rxHandle = mr.Groups[1].Value;
-                    _rxLen = mr.Groups[2].Value;
-                    if (OnLog != null) OnLog("rx", line);
-                    return;                        // 提示行已记录,等待正文
-                }
-                if (_rxPending && string.Equals(line, "BLE DATA", StringComparison.Ordinal))
-                {
-                    if (OnLog != null) OnLog("rx", line);   // 中间标记行
-                    return;                        // 继续等待真正的数据行
-                }
-                if (_rxPending)
-                {
-                    // 这一行就是数据正文:合并成一条完整记录上报
-                    _rxPending = false;
-                    string merged = "+RECEIVED:" + _rxHandle + "," + _rxLen + "  " + line;
-                    if (OnLog != null) OnLog("rx", "  ↳ " + line);
-                    if (OnReceived != null) OnReceived(merged);
-                    // 不 return:仍走下方等待器/状态回填逻辑
+                    PendingInputNeeded = need;
+                    _current.PendingLen = need;
+                    _current.TwoStepDeadline = DateTime.UtcNow.AddMilliseconds(_current.TimeoutMs);
+                    if (_current.OnTwoStepInput != null) _current.OnTwoStepInput(new byte[0]);
+                    if (OnPrompt != null) OnPrompt(need);
                 }
             }
 
-            if (line.StartsWith("+ERR=", StringComparison.Ordinal))
+            Match me = ReErr.Match(line);
+            if (me.Success)
             {
                 if (OnLog != null) OnLog("err", line);
                 if (OnErrCode != null) OnErrCode(line);
             }
-            else if (StartsWithAnyEvent(line))
+            else if (IsEvent(line))
             {
                 if (OnLog != null) OnLog("event", line);
                 if (OnLinkEvent != null) OnLinkEvent(line);
             }
             else
             {
-                // +RECEIVED 提示行已在上面处理,避免重复打印
-                if (!line.StartsWith("+RECEIVED:", StringComparison.Ordinal))
-                {
-                    if (OnLog != null) OnLog("rx", line);
-                }
+                if (OnLog != null) OnLog("rx", line);
             }
 
             if (ScanActive)
             {
                 Match ms = ReScanRow.Match(line);
                 if (ms.Success && OnScanRow != null)
-                    OnScanRow(int.Parse(ms.Groups[1].Value), ms.Groups[2].Value, ms.Groups[3].Value, ms.Groups[4].Value.Trim());
+                {
+                    int idx; int.TryParse(ms.Groups[1].Value, out idx);
+                    OnScanRow(idx, ms.Groups[2].Value, ms.Groups[3].Value, ms.Groups[4].Value.Trim());
+                }
             }
             if (ObserverActive && line.StartsWith("+MAC:", StringComparison.Ordinal) && OnObserverLine != null)
                 OnObserverLine(line);
 
-            lock (_waiters)
-            {
-                for (int i = 0; i < _waiters.Count; i++)
-                {
-                    _waiters[i].Lines.Add(line);
-                    if (_waiters[i].LastRx == DateTime.MinValue) _waiters[i].LastRx = DateTime.UtcNow;
-                }
-            }
+            Match kv = ReKv.Match(line);
+            if (kv.Success && OnStateValue != null)
+                OnStateValue(kv.Groups[1].Value.ToUpperInvariant(), kv.Groups[2].Value.Trim());
 
-            if (!line.StartsWith("+ERR=", StringComparison.Ordinal))
+            // ---- 应答归属:只给当前请求 ----
+            if (_current != null && _current.Sent)
             {
-                Match kv = ReKv.Match(line);
-                if (kv.Success && OnStateValue != null)
-                    OnStateValue(kv.Groups[1].Value.ToUpperInvariant(), kv.Groups[2].Value.Trim());
+                _current.Lines.Add(line);
+                _current.LastRx = DateTime.UtcNow;
             }
         }
 
-        private static bool StartsWithAnyEvent(string line)
+        private static bool IsEvent(string line)
         {
             if (line.StartsWith("+", StringComparison.Ordinal)) return false;
+            if (line.IndexOf("CONNECTD", StringComparison.Ordinal) >= 0) return true;
+            if (line.IndexOf("DISCONNECT", StringComparison.Ordinal) >= 0) return true;
+            if (line.IndexOf("RECEIVE TIMEOUT", StringComparison.Ordinal) >= 0) return true;
             for (int i = 0; i < EventWords.Length; i++)
                 if (line.IndexOf(EventWords[i], StringComparison.Ordinal) >= 0) return true;
             return false;
+        }
+
+        // ============================================================ 队列推进
+        private void PumpQueue()
+        {
+            lock (_qLock)
+            {
+                if (_current == null && _queue.Count > 0)
+                {
+                    _current = _queue.Dequeue();
+                    try { Send(_current.Cmd); }
+                    catch (Exception ex)
+                    {
+                        // 回放/离线模式下串口不可写:仍推进请求,让注入的应答能正确归属
+                        if (OnLog != null) OnLog("err", "发送失败: " + ex.Message);
+                    }
+                    _current.Sent = true;
+                    _current.Deadline = DateTime.UtcNow.AddMilliseconds(_current.TimeoutMs);
+                    _current.LastRx = DateTime.UtcNow;
+                }
+            }
+        }
+
+        private void Settle()
+        {
+            AtRequest cur = _current;
+            if (cur == null) return;
+            DateTime now = DateTime.UtcNow;
+
+            // 两步:等待载荷提交;已提交则等最终确认
+            if (cur.IsTwoStep)
+            {
+                if (cur.PendingLen >= 0)
+                {
+                    if (now > cur.TwoStepDeadline)
+                    {
+                        if (OnLog != null) OnLog("err", "数据输入超时,已清理本次两步发送");
+                        Finish(cur, false);
+                    }
+                    return;
+                }
+            }
+
+            bool got = cur.Lines.Count > 0;
+            bool idle = got && (now - cur.LastRx).TotalMilliseconds >= cur.QuietMs;
+            if (idle || now > cur.Deadline)
+            {
+                Finish(cur, got);
+            }
+        }
+
+        private void Finish(AtRequest r, bool ok)
+        {
+            if (r == null) return;
+            if (ReferenceEquals(_current, r)) _current = null;
+            r.PendingLen = -1;
+            PendingInputNeeded = -1;
+            if (r.Cb != null)
+            {
+                List<string> snap = new List<string>(r.Lines);
+                try { r.Cb(snap, ok); } catch { }
+            }
+            PumpQueue();
+        }
+
+        /// <summary>取消所有在途请求(断开/复位时调用)</summary>
+        public void AbortAll(string why)
+        {
+            lock (_qLock)
+            {
+                List<AtRequest> all = new List<AtRequest>();
+                if (_current != null) all.Add(_current);
+                while (_queue.Count > 0) all.Add(_queue.Dequeue());
+                _current = null;
+                for (int i = 0; i < all.Count; i++)
+                {
+                    try { if (all[i].Cb != null) all[i].Cb(new List<string>(), false); } catch { }
+                }
+            }
+            _st = RxState.Line;
+            _payload = null; _payloadGot = 0;
+            PendingInputNeeded = -1;
         }
     }
 }

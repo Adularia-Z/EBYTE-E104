@@ -17,6 +17,8 @@ namespace E104
         public string Mac = "", Name = "", Ver = "";
         public int Role = -1;
         public readonly StringBuilder Wire = new StringBuilder();   // 原始字节
+        public readonly List<byte[]> Packets = new List<byte[]>();   // 按声明长度切出的完整载荷
+        public readonly List<int> PacketHandles = new List<int>();
         public Dev(string p) { Port = p; }
     }
 
@@ -84,19 +86,23 @@ namespace E104
             return null;
         }
 
-        static int Main()
+        static int Main(string[] args)
         {
             try { Console.OutputEncoding = Encoding.UTF8; } catch { }
 
             string[] ports = SerialIo.ListPorts();
             Console.WriteLine("可用串口: " + string.Join(", ", ports));
-            if (Array.IndexOf(ports, "COM3") < 0 || Array.IndexOf(ports, "COM4") < 0)
+
+            // 支持显式指定: TestDuplex.exe COM5 COM6
+            string portA = args.Length >= 2 ? args[0].ToUpperInvariant() : "COM3";
+            string portB = args.Length >= 2 ? args[1].ToUpperInvariant() : "COM4";
+            if (Array.IndexOf(ports, portA) < 0 || Array.IndexOf(ports, portB) < 0)
             {
-                Console.WriteLine("需要 COM3 与 COM4 同时可用");
-                return 2;
+                Console.WriteLine("SKIP: 需要 " + portA + " 与 " + portB + " 同时可用(可用参数指定: TestDuplex.exe COM5 COM6)");
+                return 0;                        // SKIP 视为通过(缺硬件不算失败)
             }
 
-            Dev A = new Dev("COM3"), B = new Dev("COM4");
+            Dev A = new Dev(portA), B = new Dev(portB);
             _a = A; _b = B;
             try
             {
@@ -110,6 +116,14 @@ namespace E104
                     d.Se.OnRawRx = delegate(byte[] chunk)
                     {
                         lock (cap.Wire) cap.Wire.Append(Encoding.ASCII.GetString(chunk));
+                    };
+                    d.Se.OnReceivedBinary = delegate(byte[] payload, int handle, int declared)
+                    {
+                        lock (cap.Packets)
+                        {
+                            cap.Packets.Add(payload);
+                            cap.PacketHandles.Add(handle);
+                        }
                     };
                 }
 
@@ -196,77 +210,78 @@ namespace E104
                 // ===== 6. 双向互传 =====
                 Console.WriteLine("\n[6] 双向数据互传(依据实测三行协议)");
 
-                // 6a 主 → 从
+                // 6a 主 → 从(逐字节断言)
                 string m1 = "MASTER_TO_SLAVE_" + DateTime.Now.ToString("HHmmss");
                 Console.WriteLine("\n  [6a] COM3(主) → COM4(从)   发送 \"" + m1 + "\" (" + m1.Length + "B)");
                 Drain(A); Drain(B);
+                ClearPackets(A); ClearPackets(B);
                 string r1 = string.Join(" | ", Q(A, "AT+SEND=1," + m1.Length + ",3000", 4500, 350).ToArray());
                 bool p1 = r1.Contains("INPUT BLE DATA");
                 Console.WriteLine("      主机提示: " + (p1 ? "INPUT BLE DATA ✔" : r1));
                 if (p1) A.Se.SendRaw(Encoding.ASCII.GetBytes(m1), "主→从");
-                string bWire = WaitTx(B, 2500);
-                Console.WriteLine("      从机原始: " + Esc(bWire));
-                Check("从机收到 +RECEIVED 提示", bWire.Contains("+RECEIVED:"), null);
-                Check("从机收到数据正文", bWire.Contains(m1), m1);
+                WaitTx(B, 2500);
+                byte[] exp1 = Encoding.ASCII.GetBytes(m1);
+                byte[] got1 = LastPacket(B);
+                Check("从机收到完整载荷", got1 != null, got1 == null ? "(无)" : Hex(got1));
+                Check("载荷长度与声明一致", got1 != null && got1.Length == exp1.Length, got1 == null ? "-" : got1.Length + " vs " + exp1.Length);
+                Check("载荷逐字节一致", ByteEquals(got1, exp1), got1 == null ? "-" : Hex(got1));
 
-                // 6b 从 → 主
+                // 6b 从 → 主(逐字节断言)
                 string m2 = "SLAVE_TO_MASTER_" + DateTime.Now.ToString("HHmmss");
                 Console.WriteLine("\n  [6b] COM4(从) → COM3(主)   发送 \"" + m2 + "\" (" + m2.Length + "B)");
                 Drain(A); Drain(B);
+                ClearPackets(A); ClearPackets(B);
                 string r2 = string.Join(" | ", Q(B, "AT+SEND=1," + m2.Length + ",3000", 4500, 350).ToArray());
                 bool p2 = r2.Contains("INPUT BLE DATA");
                 Console.WriteLine("      从机提示: " + (p2 ? "INPUT BLE DATA ✔" : r2));
                 if (p2) B.Se.SendRaw(Encoding.ASCII.GetBytes(m2), "从→主");
-                string aWire = WaitTx(A, 2500);
-                Console.WriteLine("      主机原始: " + Esc(aWire));
-                Check("主机收到 +RECEIVED 提示", aWire.Contains("+RECEIVED:"), null);
-                Check("主机收到数据正文", aWire.Contains(m2), m2);
+                WaitTx(A, 2500);
+                byte[] exp2 = Encoding.ASCII.GetBytes(m2);
+                byte[] got2 = LastPacket(A);
+                Check("主机收到完整载荷", got2 != null, got2 == null ? "(无)" : Hex(got2));
+                Check("载荷长度与声明一致", got2 != null && got2.Length == exp2.Length, got2 == null ? "-" : got2.Length + " vs " + exp2.Length);
+                Check("载荷逐字节一致", ByteEquals(got2, exp2), got2 == null ? "-" : Hex(got2));
 
-                // 6c 连续多包
-                Console.WriteLine("\n  [6c] 连续 5 包双向可靠性");
+                // 6c 连续多包(逐字节比对)
+                Console.WriteLine("\n  [6c] 连续 5 包双向可靠性(逐字节)");
                 int okBoth = 0;
-                for (int i = 1; i <= 5; i++)
+                for (int k = 1; k <= 5; k++)
                 {
-                    string pA = "A2B#" + i;
-                    string pB = "B2A#" + i;
-                    Drain(A); Drain(B);
+                    string pA = "A2B#" + k;
+                    string pB = "B2A#" + k;
+                    Drain(A); Drain(B); ClearPackets(A); ClearPackets(B);
 
                     // 主 → 从
                     string sp = string.Join(" ", Q(A, "AT+SEND=1," + pA.Length + ",3000", 4000, 350).ToArray());
-                    bool pAok = sp.Contains("INPUT BLE DATA");
-                    if (pAok)
-                    {
-                        A.Se.SendRaw(Encoding.ASCII.GetBytes(pA), "主→从");
-                        Pump(600);                       // 等发送完成
-                    }
-                    string rb = WaitTx(B, 1200);
+                    if (sp.Contains("INPUT BLE DATA")) { A.Se.SendRaw(Encoding.ASCII.GetBytes(pA), "主→从"); Pump(600); }
+                    WaitTx(B, 1200);
+                    byte[] gotSlave = LastPacket(B);
 
                     // 从 → 主
                     string sq = string.Join(" ", Q(B, "AT+SEND=1," + pB.Length + ",3000", 4000, 350).ToArray());
-                    bool pBok = sq.Contains("INPUT BLE DATA");
-                    if (pBok)
-                    {
-                        B.Se.SendRaw(Encoding.ASCII.GetBytes(pB), "从→主");
-                        Pump(600);
-                    }
-                    string ra = WaitTx(A, 1200);
+                    if (sq.Contains("INPUT BLE DATA")) { B.Se.SendRaw(Encoding.ASCII.GetBytes(pB), "从→主"); Pump(600); }
+                    WaitTx(A, 1200);
+                    byte[] gotMaster = LastPacket(A);
 
-                    // rb = 从机收到的内容(应含 pA);ra = 主机收到的内容(应含 pB)
-                    bool slaveGotMaster = rb.Contains(pA);
-                    bool masterGotSlave = ra.Contains(pB);
-                    if (slaveGotMaster && masterGotSlave) okBoth++;
-                    Console.WriteLine(string.Format("      第{0}包  主→从 {1}   从→主 {2}{3}", i,
-                        slaveGotMaster ? "OK" : "失败", masterGotSlave ? "OK" : "失败",
-                        (slaveGotMaster && masterGotSlave) ? "" : ("   [" + Esc(rb) + " / " + Esc(ra) + "]")));
+                    bool okA = ByteEquals(gotSlave, Encoding.ASCII.GetBytes(pA));
+                    bool okB = ByteEquals(gotMaster, Encoding.ASCII.GetBytes(pB));
+                    if (okA && okB) okBoth++;
+                    Console.WriteLine(string.Format("      第{0}包  主→从 {1}   从→主 {2}{3}", k,
+                        okA ? "OK" : "失败", okB ? "OK" : "失败",
+                        (okA && okB) ? "" : ("   [" + Hex(gotSlave) + " / " + Hex(gotMaster) + "]")));
                 }
-                Check("5 包双向全部成功", okBoth == 5, okBoth + "/5");
+                Check("5 包双向逐字节一致", okBoth == 5, okBoth + "/5");
 
                 // ===== 7. 收尾 =====
                 Console.WriteLine("\n[7] 断开连接");
                 Q(A, "AT+DISCON", 3000, 350);
                 Pump(1500);
-                string after = string.Join(" ", Q(A, "AT+CONNECT_LIST?", 2000, 250).ToArray());
-                Check("已断开(列表不含 COM4)", !after.ToUpperInvariant().Contains(B.Mac.ToUpperInvariant()), null);
+                List<string> cl2 = Q(A, "AT+CONNECT_LIST?", 3000, 300);
+                string after = string.Join(" ", cl2.ToArray());
+                bool queryOk = false;
+                foreach (string l in cl2) if (l != null && (l.Contains("CONNECT_LIST") || l.Contains("NULL"))) queryOk = true;
+                Check("断开后查询成功", queryOk, after);
+                Check("断开后列表不含从机", !after.ToUpperInvariant().Contains(B.Mac.ToUpperInvariant()), after);
             }
             catch (Exception ex)
             {
@@ -284,6 +299,35 @@ namespace E104
                 ? "======== 双机互传验证全部通过 ========"
                 : ("======== 失败 " + _fail + " 项 (通过 " + _pass + ") ========"));
             return _fail == 0 ? 0 : 1;
+        }
+
+        static void ClearPackets(Dev d)
+        {
+            lock (d.Packets) { d.Packets.Clear(); d.PacketHandles.Clear(); }
+        }
+
+        static byte[] LastPacket(Dev d)
+        {
+            lock (d.Packets)
+            {
+                return d.Packets.Count > 0 ? d.Packets[d.Packets.Count - 1] : null;
+            }
+        }
+
+        static bool ByteEquals(byte[] a, byte[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
+        }
+
+        static string Hex(byte[] d)
+        {
+            if (d == null) return "(null)";
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < d.Length && i < 40; i++) { if (i > 0) sb.Append(' '); sb.Append(d[i].ToString("X2")); }
+            if (d.Length > 40) sb.Append(" …");
+            return sb.ToString();
         }
 
         static string Esc(string s)

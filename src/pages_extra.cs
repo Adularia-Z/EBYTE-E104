@@ -209,39 +209,67 @@ namespace E104
             if (!int.TryParse(adveLenTxt.Text.Trim(), out n) || n < 0 || n > 251 ||
                 !int.TryParse(adveToTxt.Text.Trim(), out to) || to < 1 || to > 5000)
             { MessageBox.Show("长度 0~251;超时 1~5000ms", "提示"); return; }
+
             _awaitInput = "EXT";
+            _twoStepSession = _se;
+            _twoStepExpect = n;
+            btnExtSend.Enabled = false;
+
             string cmd = "AT+ADV_EXT" + (cur ? "_CUR" : "") + "=" + n + "," + to;
-            _se.Query(cmd, delegate(List<string> lines, bool okk)
+            AtRequest req = _se.QueryTwoStep(cmd, delegate(byte[] _)
             {
-                if (LinesHave(lines, "INPUT EXT ADV"))
-                    stReply.Text = "⏳ 扩展广播等待输入 " + _se.PendingInputNeeded + " 字节 → 填好数据后按[发送数据]";
-                else
-                    stReply.Text = "✘ " + cmd + " → " + (LinesHave(lines, "+ERR") ? "错误(见日志)" : "格式异常");
-            }, to + 2500, 300);
+                // 收到 INPUT EXT ADV:n 提示回调 → 点亮发送按钮
+                _twoStepExpect = (_se != null && _se.PendingInputNeeded > 0) ? _se.PendingInputNeeded : n;
+                btnExtSend.Enabled = true;
+                btnBleSend.Enabled = false;
+                stReply.Text = "⏳ 扩展广播待输入 " + _twoStepExpect + " 字节 → 填写数据后按[发送数据]";
+                Log("sys", "扩展广播:已收到输入提示,等待 " + _twoStepExpect + " 字节");
+            }, to + 3000);
+
+            // 句柄变化即视为失败/超时 → 清理状态
+            _extTwoStepReq = req;
         }
+
+        AtRequest _extTwoStepReq = null;
+        Session _twoStepSession = null;
+        int _twoStepExpect = -1;
 
         private void SendExtData()
         {
-            if (_se == null) return;
+            Session se = _twoStepSession ?? _se;
+            if (se == null) { MessageBox.Show("串口未连接", "提示"); return; }
             byte[] data = ParseDataBox(adveDataTxt, adveFmtCmb);
             if (data == null) return;
-            int need = _se.PendingInputNeeded;
-            int want; int.TryParse(adveLenTxt.Text.Trim(), out want);
-            if (want <= 0) want = need;
-            if (data.Length != need && need >= 0)
+
+            int need = _twoStepExpect;
+            if (need < 0 && se.PendingInputNeeded > 0) need = se.PendingInputNeeded;
+            if (need < 0)
             {
-                if (MessageBox.Show("需要 " + need + " 字节,当前 " + data.Length + " 字节。截断/补齐发送?",
-                    "长度不符", MessageBoxButtons.YesNo) != DialogResult.Yes) return;
-                if (data.Length > need)
-                { byte[] t = new byte[need]; Array.Copy(data, t, need); data = t; }
-                else
-                { byte[] t2 = new byte[need]; Array.Copy(data, t2, data.Length); data = t2; }
+                MessageBox.Show("当前没有待发送的扩展广播请求,请先点[启动·保存]或[启动·_CUR]", "提示");
+                return;
             }
-            _se.SendRaw(data, "扩展广播数据");
-            _se.PendingInputNeeded = -1;
+
+            if (data.Length != need)
+            {
+                if (MessageBox.Show("需要 " + need + " 字节,当前 " + data.Length + " 字节。截断/补齐后发送?",
+                    "长度不符", MessageBoxButtons.YesNo) != DialogResult.Yes) return;
+                byte[] t = new byte[need];
+                Array.Copy(data, t, Math.Min(need, data.Length));
+                data = t;
+            }
+
+            bool ok = se.SendTwoStepPayload(data);
+            if (!ok)
+            {
+                MessageBox.Show("提交失败:两步请求已结束或超时,请重新启动", "提示");
+                btnExtSend.Enabled = false;
+                return;
+            }
+            _twoStepExpect = -1;
             _awaitInput = null;
             btnExtSend.Enabled = false;
             stReply.Text = "✔ 扩展广播数据已发送,等待模块 +OK";
+            Log("sys", "扩展广播:已提交 " + data.Length + " 字节,等待最终确认");
         }
 
         private byte[] ParseDataBox(TextBox tb, Control fmt)
@@ -403,7 +431,16 @@ namespace E104
             btnScanStart.Click += delegate { StartScan(); };
             btnScanStop = rs.RowButton("停止", 74, BtnKind.Normal, Tips["SCAN"]);
             btnScanStop.Click += delegate
-            { if (_se != null) { _se.ScanActive = false; _se.Query("AT+SCAN=0", null, 2000, 300); } };
+            {
+                // 先停止收集(避免 AT+SCAN=0 的应答混入列表),再下发停止指令
+                if (_se != null)
+                {
+                    _se.ScanActive = false;
+                    _scanDeadline = DateTime.MinValue;
+                    _se.Query("AT+SCAN=0", null, 2000, 300);
+                    stReply.Text = "扫描已停止(" + scanLv.Items.Count + " 台)";
+                }
+            };
             FlatBtn bclr = rs.RowButton("清空列表", 84, BtnKind.Normal, null);
             bclr.Click += delegate { scanLv.Items.Clear(); };
             rs.RowEnd(6);
@@ -607,6 +644,7 @@ namespace E104
         DarkCombo _scCmpOn;
         Label _obsStateLbl;
         FlatBtn _obsPauseBtn;
+        DateTime _scanDeadline = DateTime.MinValue;   // 扫描收集窗口截止时间
 
         private void StartScan()
         {
@@ -614,16 +652,24 @@ namespace E104
             if (!int.TryParse(_scanToTxt.Text.Trim(), out secs) || secs < 1 || secs > 600)
             { MessageBox.Show("超时 1~600 秒", "提示"); return; }
             if (_se == null) { MessageBox.Show("请先连接串口", "提示"); return; }
+            Session scanSe = _se;                    // 绑定发起扫描的会话
             scanLv.Items.Clear();
-            _se.ScanActive = true;
+            scanSe.ScanActive = true;
             string show = _scanNameChk.Checked ? "1" : "0";
             string cmd = "AT+SCAN=1," + secs + "," + show;
-            _se.Query(cmd, delegate(List<string> lines, bool okk)
+
+            // 关键:扫描期间不能因"首条应答后静默"而提前结束 ——
+            // 用整段扫描时长作为收集窗口,靠 ScanActive + 超时/停止按钮收尾
+            _scanDeadline = DateTime.Now.AddSeconds(secs);
+            scanSe.Query(cmd, delegate(List<string> lines, bool okk)
             {
-                _se.ScanActive = false;
+                // 该回调在扫描窗口结束后触发
+                scanSe.ScanActive = false;
+                _scanDeadline = DateTime.MinValue;
                 stReply.Text = "扫描结束(" + scanLv.Items.Count + " 台)";
-            }, secs * 1000 + 3000, 700);
-            stReply.Text = "⏳ 扫描中…";
+                Log("sys", "扫描结束,共 " + scanLv.Items.Count + " 台");
+            }, secs * 1000 + 4000, secs * 1000 + 2000);   // 静默阈值 = 整个扫描时长
+            stReply.Text = "⏳ 扫描中…(最长 " + secs + " 秒)";
         }
 
         public void ScanAddRow(int idx, string mac, string rssi, string name)
@@ -665,35 +711,60 @@ namespace E104
             if (data == null) return;
             int to;
             if (!int.TryParse(sendToTxt.Text.Trim(), out to) || to < 1 || to > 5000) to = 500;
+
             _sendPending = data;
             _awaitInput = "SEND";
+            _twoStepSession = _se;
+            _twoStepExpect = data.Length;
+            btnBleSend.Enabled = false;
+            btnExtSend.Enabled = false;
+
             string cmd = "AT+SEND=" + h + "," + data.Length + "," + to;
-            _se.Query(cmd, delegate(List<string> lines, bool okk)
+            _se.QueryTwoStep(cmd, delegate(byte[] _)
             {
-                if (LinesHave(lines, "INPUT BLE DATA"))
-                    stReply.Text = "⏳ SEND 待输入 " + _se.PendingInputNeeded + " 字节 → 按[发送数据]";
-                else
-                    stReply.Text = "✘ " + cmd + " → " + (LinesHave(lines, "+ERR") ? "错误(见日志/状态栏)" : "无应答");
-                btnBleSend.Enabled = LinesHave(lines, "INPUT BLE DATA");
-            }, to + 2500, 350);
+                _twoStepExpect = (_se != null && _se.PendingInputNeeded > 0)
+                                 ? _se.PendingInputNeeded : data.Length;
+                btnBleSend.Enabled = true;
+                stReply.Text = "⏳ SEND 待输入 " + _twoStepExpect + " 字节 → 按[发送数据]";
+                Log("sys", "SEND:已收到输入提示,等待 " + _twoStepExpect + " 字节(handle=" + h + ")");
+            }, to + 3000);
         }
 
         private void SendBleData()
         {
-            if (_se == null || _sendPending == null) { MessageBox.Show("先[启动 SEND]等模块提示", "提示"); return; }
-            int need = _se.PendingInputNeeded;
-            byte[] data = _sendPending;
-            if (need >= 0 && data.Length != need)
+            Session se = _twoStepSession ?? _se;
+            if (se == null) { MessageBox.Show("串口未连接", "提示"); return; }
+            if (_sendPending == null) { MessageBox.Show("先[启动 SEND]等模块提示", "提示"); return; }
+            if (_twoStepExpect < 0 && se.PendingInputNeeded > 0) _twoStepExpect = se.PendingInputNeeded;
+
+            int need = _twoStepExpect;
+            if (need < 0)
             {
-                if (MessageBox.Show("需要 " + need + " 字节,当前 " + data.Length + " 字节,发送?",
-                    "长度确认", MessageBoxButtons.YesNo) != DialogResult.Yes) return;
-                if (data.Length > need) { byte[] t = new byte[need]; Array.Copy(data, t, need); data = t; }
+                MessageBox.Show("当前没有待发送的 SEND 请求,请先[启动 SEND]", "提示");
+                return;
             }
-            _se.SendRaw(data, "SEND数据");
-            _se.PendingInputNeeded = -1;
+            byte[] data = _sendPending;
+            if (data.Length != need)
+            {
+                if (MessageBox.Show("需要 " + need + " 字节,当前 " + data.Length + " 字节。截断/补齐后发送?",
+                    "长度确认", MessageBoxButtons.YesNo) != DialogResult.Yes) return;
+                byte[] t = new byte[need];
+                Array.Copy(data, t, Math.Min(need, data.Length));
+                data = t;
+            }
+
+            bool ok = se.SendTwoStepPayload(data);
+            if (!ok)
+            {
+                MessageBox.Show("提交失败:两步请求已结束或超时,请重新启动", "提示");
+                btnBleSend.Enabled = false;
+                return;
+            }
+            _twoStepExpect = -1;
             _awaitInput = null;
             _sendPending = null;
             btnBleSend.Enabled = false;
+            stReply.Text = "✔ SEND 数据已提交,等待模块 +OK";
         }
 
         private void FillAutoCnt()

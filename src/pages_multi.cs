@@ -11,6 +11,17 @@ namespace E104
     public partial class MainForm
     {
         ListView devLv;
+        /// <summary>链路事件缓存(由 OnLinkEvent 填充,供连接判定使用)</summary>
+        static readonly List<string> _linkEvents = new List<string>();
+        public static void PushLinkEvent(string evt)
+        {
+            if (string.IsNullOrEmpty(evt)) return;
+            lock (_linkEvents)
+            {
+                _linkEvents.Add(evt);
+                if (_linkEvents.Count > 200) _linkEvents.RemoveRange(0, 100);
+            }
+        }
         ComboBoxHelper ppA, ppB;
         DarkCheck chkCombined;
         Label lblPlan;
@@ -277,23 +288,57 @@ namespace E104
             sb.Append("是否继续?");
             if (MessageBox.Show(sb.ToString(), "确认应用主从分配", MessageBoxButtons.OKCancel) != DialogResult.OK) return;
 
+            // 逐台串行(主在前,从依次),每台:写角色 → 复位 → 回读校验
             List<DeviceSession> all = new List<DeviceSession>();
             all.Add(p.Master);
             all.AddRange(p.Slaves);
-            int mi = 0;
-            StepSetRole(all, 0, p.Master, masterRole, delegate
+
+            PlanLog("=== 开始主从分配(逐台执行)===");
+            ApplyMixedRoles(all, 0, p.Master, masterRole, delegate
             {
-                PlanLog("主 " + p.Master.PortName + " → ROLE=" + masterRole + " 完成");
-                for (int i = 0; i < p.Slaves.Count; i++)
-                {
-                    DeviceSession s = p.Slaves[i];
-                    SendCmdOn(s, "AT+ROLE=0", delegate(string r)
-                    {
-                        PlanLog("从 " + s.PortName + " → ROLE=0  " + r);
-                        if (s == p.Slaves[p.Slaves.Count - 1]) AfterRoleApplied(all);
-                    });
-                }
+                PlanLog("=== 主从分配完成,可执行 [③ 点对点连接] ===");
+                RefreshDeviceList();
             });
+        }
+
+        /// <summary>逐台应用角色:主用 masterRole,其余用 0</summary>
+        private void ApplyMixedRoles(List<DeviceSession> list, int idx, DeviceSession master, int masterRole, Action done)
+        {
+            if (idx >= list.Count)
+            {
+                if (done != null) done();
+                return;
+            }
+            DeviceSession d = list[idx];
+            int role = (d == master) ? masterRole : 0;
+            string cmd = "AT+ROLE=" + role;
+            PlanLog("[" + (idx + 1) + "/" + list.Count + "] " + d.PortName + " → " + cmd);
+
+            d.Se.Query(cmd, delegate(List<string> lines, bool ok)
+            {
+                bool ack = false;
+                foreach (string l in lines) if (l != null && l.Trim() == "+OK") ack = true;
+                if (!ack)
+                {
+                    PlanLog("  ✘ 写入失败: " + string.Join(" | ", lines.ToArray()));
+                    ApplyMixedRoles(list, idx + 1, master, masterRole, done);
+                    return;
+                }
+                PlanLog("  ✔ 已写入,复位生效…");
+                d.Se.Query("AT+RESET", delegate(List<string> rl, bool rok)
+                {
+                    Delay(3200, delegate
+                    {
+                        HandshakeThenReadRole(d, 0, role, delegate(bool okRole)
+                        {
+                            PlanLog("  " + (okRole ? "✔" : "✘") + " 回读 " + d.PortName
+                                    + " ROLE=" + (d.Role >= 0 ? d.Role.ToString() : "?")
+                                    + (okRole ? "" : "(期望 " + role + ")"));
+                            ApplyMixedRoles(list, idx + 1, master, masterRole, done);
+                        });
+                    });
+                }, 4500, 600);
+            }, 3000, 260);
         }
 
         private void StepSetRole(List<DeviceSession> all, int i, DeviceSession master, int masterRole, Action done)
@@ -340,18 +385,83 @@ namespace E104
             if (multi.Count == 0) { MessageBox.Show("尚未接入模组", "提示"); return; }
             if (MessageBox.Show("将把所有模组设为从角色(0)并复位,继续?", "确认",
                 MessageBoxButtons.OKCancel) != DialogResult.OK) return;
-            for (int i = 0; i < multi.Count; i++)
+
+            List<DeviceSession> all = new List<DeviceSession>(multi.Devices);
+            PlanLog("=== 全部恢复从角色(逐台:写角色 → 复位 → 回读)===");
+            ApplyRoleOneByOne(all, 0, 0, null);
+        }
+
+        /// <summary>
+        /// 逐台串行写角色并复位回读:
+        ///  写 AT+ROLE=n → 等 +OK → AT+RESET → 等 MODULE POWERUP / 固定延时 → 握手重试 → 回读 ROLE
+        /// 每台完成后再处理下一台,避免同一串口并发。
+        /// </summary>
+        private void ApplyRoleOneByOne(List<DeviceSession> list, int idx, int role, Action done)
+        {
+            if (list == null || idx >= list.Count)
             {
-                DeviceSession d = multi.Devices[i];
-                SendCmdOn(d, "AT+ROLE=0", delegate(string r) { PlanLog(d.PortName + " → ROLE=0 " + r); });
+                PlanLog("=== 全部完成 ===");
+                RefreshDeviceList();
+                if (done != null) done();
+                return;
             }
-            System.Windows.Forms.Timer t = new System.Windows.Forms.Timer();
-            t.Interval = 2000; t.Tick += delegate
+            DeviceSession d = list[idx];
+            string cmd = "AT+ROLE=" + role;
+            PlanLog("[" + (idx + 1) + "/" + list.Count + "] " + d.PortName + " → " + cmd);
+
+            d.Se.Query(cmd, delegate(List<string> lines, bool ok)
             {
-                t.Stop(); t.Dispose();
-                for (int i = 0; i < multi.Count; i++) ChainReadOn(multi.Devices[i], new string[] { "ROLE" }, 0, null);
-            };
-            t.Start();
+                bool ack = false;
+                foreach (string l in lines) if (l != null && l.Trim() == "+OK") ack = true;
+                if (!ack)
+                {
+                    PlanLog("  ✘ 写入失败: " + string.Join(" | ", lines.ToArray()));
+                    ApplyRoleOneByOne(list, idx + 1, role, done);
+                    return;
+                }
+                PlanLog("  ✔ 角色已写入,复位生效…");
+
+                d.Se.Query("AT+RESET", delegate(List<string> rl, bool rok)
+                {
+                    // 复位后等待重启完成再握手回读
+                    Delay(3200, delegate
+                    {
+                        HandshakeThenReadRole(d, 0, role, delegate(bool okRole)
+                        {
+                            PlanLog("  " + (okRole ? "✔" : "✘") + " 回读校验 " + d.PortName
+                                    + " ROLE=" + (d.Role >= 0 ? d.Role.ToString() : "?"));
+                            ApplyRoleOneByOne(list, idx + 1, role, done);
+                        });
+                    });
+                }, 4500, 600);
+            }, 3000, 260);
+        }
+
+        /// <summary>复位后重试握手并回读角色</summary>
+        private void HandshakeThenReadRole(DeviceSession d, int attempt, int expectRole, Action<bool> cb)
+        {
+            if (attempt > 6) { if (cb != null) cb(false); return; }
+            d.Se.Query("AT", delegate(List<string> lines, bool ok)
+            {
+                bool ack = false;
+                foreach (string l in lines) if (l != null && l.Trim() == "+OK") ack = true;
+                if (!ack)
+                {
+                    Delay(500, delegate { HandshakeThenReadRole(d, attempt + 1, expectRole, cb); });
+                    return;
+                }
+                d.Se.Query("AT+ROLE?", delegate(List<string> rl, bool ok2)
+                {
+                    int got = -1;
+                    foreach (string l in rl)
+                    {
+                        Match m = Regex.Match(l ?? "", @"^\+ROLE\s*=\s*([0-3])");
+                        if (m.Success) { int.TryParse(m.Groups[1].Value, out got); break; }
+                    }
+                    d.Role = got;
+                    if (cb != null) cb(got == expectRole);
+                }, 2000, 200);
+            }, 1500, 220);
         }
 
         // ================= 点对点 =================
@@ -369,32 +479,187 @@ namespace E104
         {
             RolePlan p = RolePlanner.PlanMasterSlave(multi.Devices, chkCombined.Checked);
             if (!p.Ok) { MessageBox.Show(p.Message, "提示"); return; }
-            for (int i = 0; i < p.Slaves.Count; i++) P2PConnect(p.Master, p.Slaves[i]);
+            PlanLog("=== 依次连接 " + p.Slaves.Count + " 台从机 ===");
+            ConnectSlavesSequential(p.Master, p.Slaves, 0);
+        }
+
+        /// <summary>串行连接:前一台结果明确(成功/失败/超时)后再连下一台</summary>
+        private void ConnectSlavesSequential(DeviceSession master, List<DeviceSession> slaves, int idx)
+        {
+            if (slaves == null || idx >= slaves.Count)
+            {
+                PlanLog("=== 连接流程结束 ===");
+                RefreshDeviceList();
+                return;
+            }
+            PlanLog("[" + (idx + 1) + "/" + slaves.Count + "] ");
+            P2PConnect(master, slaves[idx], delegate(bool ok)
+            {
+                // 无论成功与否,都等这一步结束后再继续
+                ConnectSlavesSequential(master, slaves, idx + 1);
+            });
         }
 
         /// <summary>主机扫描 → 找到从机 MAC → 发起连接</summary>
-        private void P2PConnect(DeviceSession master, DeviceSession slave)
+        /// <summary>
+        /// 点对点连接。严格判定:
+        ///  ① AT+CONNECT 回 +OK 后显示"连接中"
+        ///  ② 等待目标 MAC 的 CONNECTD 事件(精确匹配,排除 DISCONNECTED 误命中)
+        ///  ③ 用 AT+CONNECT_LIST? 核实链路与 handle
+        ///  ④ 成功后留 1 秒服务发现时间
+        /// </summary>
+        private void P2PConnect(DeviceSession master, DeviceSession slave, Action<bool> done = null)
         {
-            if (master == null || slave == null) return;
+            if (master == null || slave == null) { if (done != null) done(false); return; }
             if (string.IsNullOrEmpty(slave.Mac) || slave.Mac == "-")
             {
                 PlanLog("从机 " + slave.PortName + " 尚未读到 MAC,先读取…");
-                ChainReadOn(slave, new string[] { "MAC", "ROLE" }, 0, delegate { P2PConnect(master, slave); });
+                ChainReadOn(slave, new string[] { "MAC", "ROLE" }, 0, delegate { P2PConnect(master, slave, done); });
                 return;
             }
-            PlanLog("主机 " + master.PortName + " 连接从机 " + slave.PortName + " (" + slave.Mac + ") …");
-            string cmd = "AT+CONNECT=," + slave.Mac;
+
+            string mac = slave.Mac.ToUpperInvariant();
+            PlanLog("主机 " + master.PortName + " → 从机 " + slave.PortName + " (" + mac + ") 连接中…");
+            string cmd = "AT+CONNECT=," + mac;
+
+            // 捕获带 +OK 的首个应答,随后单独核实
             master.Se.Query(cmd, delegate(List<string> lines, bool ok)
             {
                 string r = string.Join(" | ", lines.ToArray());
-                PlanLog("  " + cmd + " → " + r);
-                if (r.Contains("CONNECTD") || r.Contains("CONNECTED"))
-                    PlanLog("✔ 已连接 " + slave.Mac);
-                else if (r.Contains("TIMEOUT"))
-                    PlanLog("✘ 连接超时(检查从机是否在广播、主从距离/波特率)");
-                else
-                    PlanLog("✘ 连接失败(详见 +ERR 错误码)");
-            }, 13000, 400);
+                PlanLog("  " + cmd + " → " + (r.Length > 0 ? r : "(无应答)"));
+
+                bool okAck = false;
+                foreach (string l in lines) if (l != null && l.Trim() == "+OK") okAck = true;
+
+                if (!okAck)
+                {
+                    if (r.Contains("+ERR"))
+                    {
+                        PlanLog("  ✘ 连接被拒(错误码见状态栏):" + r);
+                    }
+                    else
+                    {
+                        PlanLog("  ✘ 未收到 +OK(可能超时或链路异常)");
+                    }
+                    if (done != null) done(false);
+                    return;
+                }
+
+                // ② 等目标 MAC 的连接事件(Session 已在扫描;用 CONNECTD 精确匹配)
+                PlanLog("  +OK 已收到,等待连接事件…");
+                WaitConnectEvent(master, mac, 12000, delegate(bool evtOk, string evt)
+                {
+                    if (evt.Length > 0) PlanLog("  事件: " + evt);
+                    // ③ 无论事件如何,都用连接列表核实(事件可能丢失)
+                    VerifyLink(master, mac, delegate(bool linked, int handle)
+                    {
+                        if (linked)
+                        {
+                            master.LastHandle = handle;
+                            PlanLog("  ✔ 已连接 " + mac + (handle >= 0 ? " (handle=" + handle + ")" : ""));
+                            // ④ 给服务发现留时间
+                            Delay(1000, delegate { if (done != null) done(true); });
+                        }
+                        else
+                        {
+                            PlanLog("  ✘ 未建立链路(事件 " + (evtOk ? "成功" : "失败") + ",连接列表无此设备)");
+                            if (done != null) done(false);
+                        }
+                    });
+                });
+            }, 14000, 600);
+        }
+
+        /// <summary>等待目标 MAC 的 CONNECTD 事件(精确匹配,排除 DISCONNECTED)</summary>
+        private void WaitConnectEvent(DeviceSession master, string mac, int timeoutMs, Action<bool, string> cb)
+        {
+            DateTime end = DateTime.Now.AddMilliseconds(timeoutMs);
+            string found = "";
+            DelayRunner runner = null;
+            runner = new DelayRunner(200, delegate
+            {
+                lock (_linkEvents)
+                {
+                    for (int i = 0; i < _linkEvents.Count; i++)
+                    {
+                        string e = _linkEvents[i];
+                        if (e != null && MatchesConnectEvent(e, mac)) { found = e; _linkEvents.RemoveAt(i); break; }
+                    }
+                }
+                if (found.Length > 0) { runner.Stop(); cb(true, found); return; }
+                if (DateTime.Now >= end) { runner.Stop(); cb(false, ""); }
+            });
+            runner.Start();
+        }
+
+        /// <summary>
+        /// 精确判断"连接成功"事件:
+        ///   XX:.. CONNECTD C*n   /  CONNECTD P*n   (注意 DISCONNECTED / DISCONNECTD 不算)
+        /// </summary>
+        public static bool MatchesConnectEvent(string evt, string mac)
+        {
+            if (string.IsNullOrEmpty(evt) || string.IsNullOrEmpty(mac)) return false;
+            string u = evt.ToUpperInvariant();
+            string m = mac.ToUpperInvariant();
+            if (u.IndexOf(m, StringComparison.Ordinal) < 0) return false;
+            if (u.IndexOf("DISCONNECT", StringComparison.Ordinal) >= 0) return false;   // 断开事件
+            if (u.IndexOf("DISCONNECTD", StringComparison.Ordinal) >= 0) return false;
+            if (u.IndexOf("TIMEOUT", StringComparison.Ordinal) >= 0) return false;
+            return u.IndexOf("CONNECTD", StringComparison.Ordinal) >= 0
+                || u.IndexOf("CONNECTED", StringComparison.Ordinal) >= 0;
+        }
+
+        /// <summary>从连接事件里解析 handle(如 "CONNECTD C*1" → 1)</summary>
+        public static int ParseHandle(string evt)
+        {
+            if (string.IsNullOrEmpty(evt)) return -1;
+            Match hm = Regex.Match(evt, @"CONNECT(?:D|ED)\s*[CP]\s*\*\s*(\d+)");
+            if (hm.Success) { int h; int.TryParse(hm.Groups[1].Value, out h); return h; }
+            return -1;
+        }
+
+        /// <summary>用 AT+CONNECT_LIST 核实链路是否存在</summary>
+        private void VerifyLink(DeviceSession master, string mac, Action<bool, int> cb)
+        {
+            master.Se.Query("AT+CONNECT_LIST?", delegate(List<string> lines, bool ok)
+            {
+                bool linked = false; int handle = -1;
+                string u = mac.ToUpperInvariant();
+                for (int i = 0; i < lines.Count; i++)
+                {
+                    string l = lines[i];
+                    if (string.IsNullOrEmpty(l)) continue;
+                    if (l.ToUpperInvariant().IndexOf(u, StringComparison.Ordinal) < 0) continue;
+                    linked = true;
+                    Match hm = Regex.Match(l, @"^\s*(\d+)\s*P?\s*,");
+                    if (hm.Success) { int h; int.TryParse(hm.Groups[1].Value, out h); handle = h; }
+                    break;
+                }
+                PlanLog("  连接列表: " + string.Join(" | ", lines.ToArray()));
+                cb(linked, handle);
+            }, 3000, 250);
+        }
+
+        /// <summary>延迟执行(不阻塞 UI)</summary>
+        private void Delay(int ms, Action a)
+        {
+            DelayRunner r = null;
+            r = new DelayRunner(ms, delegate { r.Stop(); a(); });
+            r.Start();
+        }
+
+        /// <summary>简单的定时器封装</summary>
+        private class DelayRunner
+        {
+            private readonly System.Windows.Forms.Timer _t;
+            public DelayRunner(int ms, EventHandler h)
+            {
+                _t = new System.Windows.Forms.Timer();
+                _t.Interval = Math.Max(50, ms);
+                _t.Tick += h;
+            }
+            public void Start() { _t.Start(); }
+            public void Stop() { try { _t.Stop(); _t.Dispose(); } catch { } }
         }
 
         /// <summary>在指定设备下发指令(不依赖激活通道)</summary>

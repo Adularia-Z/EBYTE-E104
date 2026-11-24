@@ -21,6 +21,10 @@ namespace E104
         public bool Ready = false;            // 握手完成
         public string LastError = "";
         public int Index = 0;                 // 0..4
+        /// <summary>本设备的参数快照(由应答回填),与其它模组隔离</summary>
+        public readonly Dictionary<string, string> State = new Dictionary<string, string>();
+        /// <summary>本设备的连接 handle(从 CONNECTD 事件解析)</summary>
+        public int LastHandle = -1;
 
         public string RoleText
         {
@@ -39,17 +43,33 @@ namespace E104
     {
         public const int MaxDevices = 5;
         public readonly List<DeviceSession> Devices = new List<DeviceSession>();
-        public int ActiveIndex = 0;
+
+        private DeviceSession _active = null;      // 按对象引用追踪,移除其它设备不会改目标
 
         public DeviceSession Active
         {
             get
             {
-                if (Devices.Count == 0) return null;
-                if (ActiveIndex < 0 || ActiveIndex >= Devices.Count) ActiveIndex = 0;
-                return Devices[ActiveIndex];
+                if (_active != null && Devices.Contains(_active)) return _active;
+                _active = Devices.Count > 0 ? Devices[0] : null;
+                return _active;
+            }
+            set
+            {
+                if (value != null && Devices.Contains(value)) _active = value;
             }
         }
+
+        /// <summary>兼容旧的按下标设置(仅用于 UI 列表点击)</summary>
+        public int ActiveIndex
+        {
+            get { DeviceSession a = Active; return a == null ? -1 : a.Index; }
+            set
+            {
+                if (value >= 0 && value < Devices.Count) _active = Devices[value];
+            }
+        }
+
         public int Count { get { return Devices.Count; } }
         public bool CanAdd { get { return Devices.Count < MaxDevices; } }
 
@@ -67,9 +87,11 @@ namespace E104
         {
             for (int i = 0; i < Devices.Count; i++)
             {
+                try { Devices[i].Se.AbortAll("断开"); } catch { }
                 try { if (Devices[i].Io != null) Devices[i].Io.Dispose(); } catch { }
             }
             Devices.Clear();
+            _active = null;
         }
 
         public DeviceSession Add(string port, int baud, Action<string> onError)
@@ -83,16 +105,29 @@ namespace E104
             d.Se = new Session(io);
             d.Index = Devices.Count;
             Devices.Add(d);
+            if (_active == null) _active = d;      // 首个设备自动成为目标
             return d;
         }
 
-        public void Remove(DeviceSession d)
+        /// <summary>
+        /// 移除设备。规则:
+        ///  - 移除的不是目标 → 目标保持不变(不因下标变化而跳走)
+        ///  - 移除的正是目标 → 优先选同端口的新会话,否则选列表第一个,并标记目标已失效
+        /// </summary>
+        public bool Remove(DeviceSession d)
         {
-            if (d == null) return;
+            if (d == null || !Devices.Contains(d)) return false;
+            bool wasActive = ReferenceEquals(_active, d);
+            try { d.Se.AbortAll("断开"); } catch { }
             try { if (d.Io != null) d.Io.Dispose(); } catch { }
             Devices.Remove(d);
             for (int i = 0; i < Devices.Count; i++) Devices[i].Index = i;
-            if (ActiveIndex >= Devices.Count) ActiveIndex = Math.Max(0, Devices.Count - 1);
+            if (wasActive)
+            {
+                _active = Devices.Count > 0 ? Devices[0] : null;
+                return true;                       // 通知调用方:目标已被移除
+            }
+            return false;
         }
     }
 

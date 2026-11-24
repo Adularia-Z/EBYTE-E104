@@ -48,6 +48,8 @@ namespace E104
         int _logHistIdx = -1;
         System.Windows.Forms.Timer _logRepeatTimer = null;
         string _logRepeatText = null;
+        Session _logRepeatSession = null;      // 定时重发绑定的会话(切换模组不影响)
+        string _logRepeatPort = "";           // 便于日志追溯
         CheckBox chkAutoScroll, chkHex;
         FlatBtn btnCollapse, btnClearLog, btnExportLog, btnFreeze;
         Label stRole, stReply, stErr, stCount;
@@ -1065,6 +1067,8 @@ namespace E104
             };
             se.OnLinkEvent = delegate(string l)
             {
+                // 事件统一入队(供连接判定),非激活通道也记录,避免漏判
+                PushLinkEvent(l);
                 if (owner != null && owner != multi.Active) return;
                 stReply.Text = "事件 " + l;
             };
@@ -1102,6 +1106,7 @@ namespace E104
             else if (k == "NAME") d.Name = v;
             else if (k == "MAC") d.Mac = v;
             else if (k == "VERSION") d.Version = v;
+            if (!string.IsNullOrEmpty(k)) d.State[k] = v;
             RefreshDeviceList();
         }
 
@@ -1404,18 +1409,65 @@ namespace E104
             if (!int.TryParse(txtLogRepeatMs.Text.Trim(), out ms) || ms < 100) ms = 1000;
             txtLogRepeatMs.Text = ms.ToString();
             _logRepeatText = s;
-            if (_logRepeatTimer == null) { _logRepeatTimer = new System.Windows.Forms.Timer(); _logRepeatTimer.Tick += delegate { LogSend(true); }; }
+            // 关键:绑定启动时的会话与端口 —— 之后切换激活模组不影响本次重发目标
+            _logRepeatSession = _se;
+            _logRepeatPort = (multi.Active != null) ? multi.Active.PortName : "?";
+            if (_logRepeatTimer == null)
+            {
+                _logRepeatTimer = new System.Windows.Forms.Timer();
+                _logRepeatTimer.Tick += delegate { LogSendBound(); };
+            }
             _logRepeatTimer.Interval = ms;
             _logRepeatTimer.Start();
             btnLogSendRepeat.Text = "停止重发";
             btnLogSendRepeat.Kind = BtnKind.Danger;
             btnLogSendRepeat.Invalidate();
-            Log("sys", "定时重发已启动: 每 " + ms + " ms 发送 \"" + s + "\"");
+            Log("sys", "定时重发已启动 → " + _logRepeatPort + "  每 " + ms + " ms 发送 \"" + s + "\"");
+        }
+
+        /// <summary>定时重发专用:始终发往启动时绑定的会话;该会话失效则自动停止</summary>
+        private void LogSendBound()
+        {
+            Session se = _logRepeatSession;
+            if (se == null)
+            {
+                StopLogRepeat();
+                Log("err", "定时重发已停止: 目标会话已失效");
+                return;
+            }
+            string s = _logRepeatText ?? "";
+            if (s.Length == 0) { StopLogRepeat(); return; }
+            try
+            {
+                bool hex = (cmbLogFmt.SelectedIndex == 1);
+                if (hex)
+                {
+                    byte[] d = ParseHexLenient(s);
+                    if (d == null) { StopLogRepeat(); return; }
+                    if (chkLogCrlf.Checked) d = AppendCrlf(d);
+                    se.SendRaw(d, "定时HEX");
+                }
+                else if (chkLogCrlf.Checked)
+                {
+                    if (s.StartsWith("AT", StringComparison.OrdinalIgnoreCase))
+                        se.Query(s, null, 4000, 120);
+                    else
+                        se.SendRaw(Encoding.ASCII.GetBytes(s + "\r\n"), "定时发送");
+                }
+                else se.SendRaw(Encoding.ASCII.GetBytes(s), "定时透传");
+            }
+            catch (Exception ex)
+            {
+                StopLogRepeat();
+                Log("err", "定时重发已停止: " + ex.Message);
+            }
         }
 
         private void StopLogRepeat()
         {
             if (_logRepeatTimer != null) _logRepeatTimer.Stop();
+            _logRepeatSession = null;
+            _logRepeatPort = "";
             if (btnLogSendRepeat != null)
             {
                 btnLogSendRepeat.Text = "定时重发";
@@ -1461,7 +1513,7 @@ namespace E104
                 "PHY", "BAUD", "CONN_INTERVAL", "SLEEP", "WDOG", "LOGMSG",
                 "ADVDATA", "ADV_EXT", "BEACON", "SERVICE", "UP_AUTH", "SCANCMP",
                 "AUTO_CNT", "TRM_HANDLE", "CONNECT_LIST", "OBSERVER", "SCAN" };
-            int perRow = 3, wLab = 100, wVal = 180, gx = 12, gy = rs.Y + 8;
+            int perRow = 3, wLab = 100, gx = 12, gy = rs.Y + 8;
             // 避免总览网格撑出横向滚动条:总宽受限于宿主可用宽度
             int availW = Math.Max(720, PageStack(0).Controls[0].ClientSize.Width - 36);
             int colW = availW / perRow;
@@ -1503,14 +1555,23 @@ namespace E104
                 d.FileName = "E104-BT53_config_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".json";
                 d.Filter = "JSON|*.json";
                 if (d.ShowDialog(this) != DialogResult.OK) return;
+                // 取当前激活模组的独立快照,避免与其它模组数据混淆
+                DeviceSession dev = multi.Active;
+                Dictionary<string, string> snap = (dev != null) ? dev.State : _state;
                 StringBuilder sb = new StringBuilder();
                 sb.AppendLine("{");
+                if (dev != null)
+                {
+                    sb.AppendLine("  \"_port\": \"" + dev.PortName + "\",");
+                    sb.AppendLine("  \"_mac\": \"" + (dev.Mac ?? "") + "\",");
+                    sb.AppendLine("  \"_role\": \"" + dev.Role + "\",");
+                }
                 int i = 0;
-                foreach (KeyValuePair<string, string> kv in _state)
+                foreach (KeyValuePair<string, string> kv in snap)
                 {
                     i++;
                     string v = (kv.Value ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"");
-                    sb.AppendLine("  \"" + kv.Key + "\": \"" + v + "\"" + (i < _state.Count ? "," : ""));
+                    sb.AppendLine("  \"" + kv.Key + "\": \"" + v + "\"" + (i < snap.Count ? "," : ""));
                 }
                 sb.AppendLine("}");
                 File.WriteAllText(d.FileName, sb.ToString(), Encoding.UTF8);
