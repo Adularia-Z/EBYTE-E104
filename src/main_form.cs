@@ -51,6 +51,7 @@ namespace E104
         CheckBox chkAutoScroll, chkHex;
         FlatBtn btnCollapse, btnClearLog, btnExportLog, btnFreeze;
         Label stRole, stReply, stErr, stCount;
+        FlatBtn btnErrRef;
         int _logLines = 0, _tickDiv = 0;
         bool _frozen = false;
         readonly List<string[]> _freezeBuf = new List<string[]>();   // [tag,text]
@@ -215,25 +216,17 @@ namespace E104
             statusPanel.Controls.Add(chipConn);
             stRole = new Label(); stRole.AutoSize = true; stRole.ForeColor = Theme.AccentHi; stRole.Text = "角色 -";
             statusPanel.Controls.Add(stRole);
-            stReply = new Label(); stReply.AutoSize = false; stReply.Width = 330; stReply.Height = 18;
+            stReply = new Label(); stReply.AutoSize = false; stReply.Height = 18;
             stReply.ForeColor = Theme.RxCol; stReply.Text = "最近应答 -"; stReply.AutoEllipsis = true;
             statusPanel.Controls.Add(stReply);
-            stErr = new Label(); stErr.AutoSize = false; stErr.Width = 300; stErr.Height = 18;
+            stErr = new Label(); stErr.AutoSize = false; stErr.Height = 18;
             stErr.ForeColor = Theme.Bad; stErr.AutoEllipsis = true;
             statusPanel.Controls.Add(stErr);
             stCount = new Label(); stCount.AutoSize = true; stCount.ForeColor = Theme.Dim; stCount.Text = "TX 0 · RX 0";
             statusPanel.Controls.Add(stCount);
-            FlatBtn btnErrRef = new FlatBtn("📖 错误码参考", BtnKind.Ghost); btnErrRef.Width = 100;
+            btnErrRef = new FlatBtn("错误码参考", BtnKind.Ghost); btnErrRef.Width = 92; btnErrRef.Height = 24;
             statusPanel.Controls.Add(btnErrRef); btnErrRef.Click += delegate { ShowErrRef(); };
-            statusPanel.Resize += delegate
-            {
-                chipConn.Location = new Point(10, 3);
-                stRole.Location = new Point(120, 6);
-                stReply.Location = new Point(230, 6);
-                stErr.Location = new Point(570, 6);
-                btnErrRef.Location = new Point(statusPanel.Width - btnErrRef.Width - 10, 2);
-                stCount.Location = new Point(btnErrRef.Location.X - stCount.Width - 12, 6);
-            };
+            statusPanel.Resize += delegate { LayoutStatusBar(); };
 
             // ── 日志坞 ──
             logDock = new Panel();
@@ -411,6 +404,44 @@ namespace E104
 
         public SplitContainer mainSplit;
         private int _logRestoreDist = 0;
+
+        /// <summary>
+        /// 三段式状态栏布局:
+        ///   [胶囊][角色] | [最近应答(可伸缩,空间不足则隐藏)] | [计数][错误码参考]
+        /// 从右往左先固定右侧,再分配中部剩余宽度 —— 窄窗口下 TX/RX 不会被按钮遮挡。
+        /// </summary>
+        public void LayoutStatusBar()
+        {
+            if (statusPanel == null || btnErrRef == null) return;
+            int W = statusPanel.ClientSize.Width;
+            const int pad = 8;
+
+            // 右区:错误码参考 + TX/RX 计数(优先保障)
+            int rx = W - pad;
+            btnErrRef.Location = new Point(Math.Max(0, rx - btnErrRef.Width), 3);
+            rx = btnErrRef.Location.X;
+
+            int countW = TextRenderer.MeasureText(stCount.Text, stCount.Font).Width + 2;
+            stCount.Location = new Point(Math.Max(0, rx - countW - 10), 6);
+            rx = stCount.Location.X - 10;
+
+            // 左区:连接胶囊 + 角色
+            chipConn.Location = new Point(pad, 3);
+            int lx = chipConn.Right + 10;
+            stRole.Location = new Point(lx, 6);
+            lx = stRole.Right + 14;
+
+            // 中区:剩余宽度够则显示最近应答,否则隐藏(而不是被覆盖)
+            int midW = rx - lx;
+            bool showReply = midW >= 140;
+            stReply.Visible = showReply;
+            if (showReply)
+            {
+                stReply.Width = midW;
+                stReply.Location = new Point(lx, 6);
+            }
+            stErr.Visible = false;   // 错误信息复用"最近应答"位置,避免两段争抢
+        }
 
         // ================================================================ 导航 & 页面骨架
         private void BuildPages()
