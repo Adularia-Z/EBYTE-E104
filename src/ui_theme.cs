@@ -147,9 +147,22 @@ namespace E104
             using (Pen p = new Pen(border)) g.DrawRectangle(p, 0, 0, Width - 1, Height - 1);
 
             string shown = SanitizeText(Text);
-            SizeF sz = g.MeasureString(shown, Font);
+            // 文字宽度超过控件宽度时自动缩小字号,保证不截断
+            Font drawFont = Font;
+            SizeF sz = g.MeasureString(shown, drawFont);
+            if (sz.Width > Width - 8 && shown.Length > 0)
+            {
+                float scale = (Width - 8f) / sz.Width;
+                if (scale < 0.92f)
+                {
+                    float newSize = Math.Max(6.5f, Font.Size * scale);
+                    drawFont = new Font(Font.FontFamily, newSize, Font.Style);
+                    sz = g.MeasureString(shown, drawFont);
+                }
+            }
             using (SolidBrush tb = new SolidBrush(fg))
-                g.DrawString(shown, Font, tb, (Width - sz.Width) / 2f, (Height - sz.Height) / 2f);
+                g.DrawString(shown, drawFont, tb, Math.Max(2, (Width - sz.Width) / 2f), (Height - sz.Height) / 2f);
+            if (!ReferenceEquals(drawFont, Font)) drawFont.Dispose();
         }
     }
 

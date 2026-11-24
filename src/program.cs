@@ -38,6 +38,10 @@ namespace E104
                     string[] args = Environment.GetCommandLineArgs();
                     int wantPage = -1;
                     bool autoConn = false;
+                    // 同时支持 --page:N 参数与环境变量 E104_PAGE(参数在部分启动方式下会丢失)
+                    string envPage = Environment.GetEnvironmentVariable("E104_PAGE");
+                    int ep;
+                    if (!string.IsNullOrEmpty(envPage) && int.TryParse(envPage, out ep)) wantPage = ep;
                     for (int i = 0; i < args.Length; i++)
                     {
                         if (args[i] != null && args[i].StartsWith("--page:", StringComparison.Ordinal))
@@ -47,10 +51,25 @@ namespace E104
                         }
                         if (args[i] != null && args[i] == "--autoconnect") autoConn = true;
                     }
-                    if (wantPage >= 0)
-                        f.Shown += delegate { f.BeginInvoke((MethodInvoker)delegate { f.SwitchPage(wantPage); }); };
+                    if (Environment.GetEnvironmentVariable("E104_AUTOCONNECT") == "1") autoConn = true;
+                    // 先连接;页面切换延后到应用自身定时器(避免被角色门控覆盖)
                     if (autoConn)
                         f.Shown += delegate { f.BeginInvoke((MethodInvoker)delegate { f.Connect(); }); };
+                    if (wantPage >= 0)
+                    {
+                        int target = wantPage;
+                        f.Shown += delegate
+                        {
+                            System.Windows.Forms.Timer t = new System.Windows.Forms.Timer();
+                            t.Interval = 2000;
+                            t.Tick += delegate
+                            {
+                                t.Stop(); t.Dispose();
+                                f.SwitchPage(target);
+                            };
+                            t.Start();
+                        };
+                    }
                 }
                 catch { }
 

@@ -866,13 +866,33 @@ namespace E104
 
             Card c2 = MkCard(7, "APP 配置认证 AUTH(6.3.25)", "必须大写;实际由手机 APP 配置通道发送");
             RowStack rs2 = new RowStack(c2.Body);
-            rs2.RowBegin(0);
-            rs2.RowTitle("AUTH 认证", Tips["AUTH"]);
+
+            // 与上一张卡片同一套网格列:名称/输入/当前/值/查询/下发 全部对齐
+            Label aLbl = new Label();
+            aLbl.Text = "AUTH 认证"; aLbl.ForeColor = Theme.TxT; aLbl.Font = Theme.F; aLbl.AutoSize = true;
+            DarkTips.Set(aLbl, Tips["AUTH"]);
+
             authTxt = new TextBox(); Theme.StyleText(authTxt); authTxt.Width = 96; authTxt.Text = "123456";
-            rs2.RowControl(authTxt, 16, Tips["AUTH"]);
-            FlatBtn bgo = rs2.RowButton("串口发送(实测用)", 80, BtnKind.Normal, Tips["AUTH"]);
+            DarkTips.Set(authTxt, Tips["AUTH"]);
+
+            Label aKey = new Label(); aKey.Text = "当前"; aKey.ForeColor = Theme.Dim; aKey.AutoSize = true;
+            Label aVal = Theme.Cur(); aVal.AutoSize = true; aVal.Text = "仅APP";
+            DarkTips.Set(aVal, "AUTH 认证仅在手机 APP 配置通道有效\n串口发送 AT+AUTH 会返回 +ERR=4(实测正常现象)");
+            _cur["CUR_AUTH"] = aVal;
+
+            FlatBtn bq2 = new FlatBtn("查询", BtnKind.Normal); bq2.Width = 80; bq2.Height = 26;
+            bq2.Anchor = AnchorStyles.Right;
+            bq2.Click += delegate { QueryOne("AUTH"); DarkTips.Set(aVal, Tips["AUTH"]); };
+
+            // 按钮文案较长,按文字实测宽度,避免被截断
+            FlatBtn bgo = new FlatBtn("串口发送", BtnKind.Accent);
+            bgo.Height = 26;
+            bgo.Width = Math.Max(96, TextRenderer.MeasureText("串口发送", Theme.F).Width + 26);
+            bgo.Anchor = AnchorStyles.Right;
+            DarkTips.Set(bgo, Tips["AUTH"]);
             bgo.Click += delegate { SendAndWait("AT+AUTH=" + authTxt.Text, null); };
-            rs2.RowEnd(2);
+
+            rs2.AddGridRow(aLbl, authTxt, aKey, aVal, bq2, bgo);
             CardEnd(c2, rs2);
         }
 

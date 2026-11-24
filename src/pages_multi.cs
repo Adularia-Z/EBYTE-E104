@@ -41,16 +41,46 @@ namespace E104
 
             devLv = new ListView();
             devLv.View = View.Details; devLv.FullRowSelect = true; devLv.HideSelection = false;
-            devLv.GridLines = true; devLv.BorderStyle = BorderStyle.FixedSingle;
+            devLv.GridLines = false; devLv.BorderStyle = BorderStyle.FixedSingle;
             devLv.BackColor = Color.FromArgb(24, 24, 27); devLv.ForeColor = Theme.TxT; devLv.Font = Theme.FMonoS;
+            devLv.OwnerDraw = true;
+            devLv.DrawColumnHeader += delegate(object s, DrawListViewColumnHeaderEventArgs e)
+            {
+                // 深色表头(系统默认是白底,与主题割裂)
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(38, 38, 43)))
+                    e.Graphics.FillRectangle(b, e.Bounds);
+                using (Pen p = new Pen(Theme.Border))
+                    e.Graphics.DrawLine(p, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
+                TextRenderer.DrawText(e.Graphics, e.Header.Text, Theme.F,
+                    e.Bounds, Color.FromArgb(200, 200, 208),
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            };
+            devLv.DrawItem += delegate(object s, DrawListViewItemEventArgs e) { };
+            devLv.DrawSubItem += delegate(object s, DrawListViewSubItemEventArgs e)
+            {
+                Color bg = (e.Item.Selected) ? Color.FromArgb(0, 60, 100) : Color.FromArgb(24, 24, 27);
+                using (SolidBrush b = new SolidBrush(bg)) e.Graphics.FillRectangle(b, e.Bounds);
+                Color fg = (e.ColumnIndex == 0) ? Theme.AccentHi : Theme.TxT;
+                TextRenderer.DrawText(e.Graphics, e.SubItem.Text, Theme.FMonoS,
+                    e.Bounds, fg, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            };
             devLv.Columns.Add("编号", 60); devLv.Columns.Add("串口", 90);
             devLv.Columns.Add("角色", 90); devLv.Columns.Add("广播名", 150);
             devLv.Columns.Add("MAC", 170); devLv.Columns.Add("固件", 120);
             devLv.Columns.Add("状态", 100);
+            devLv.Columns.Add("", 40);   // 尾部填充列,吃掉右侧留白(否则表头/底色露出系统白色)
             rs.Host.Controls.Add(devLv);
-            devLv.SetBounds(14, rs.Y, 860, 128);
-            rs.Host.Resize += delegate { devLv.Width = Math.Max(500, rs.Host.ClientSize.Width - 28); };
-            rs.NewRow(134);
+            devLv.SetBounds(14, rs.Y, 860, 96);
+            rs.Host.Resize += delegate
+            {
+                devLv.Width = Math.Max(500, rs.Host.ClientSize.Width - 28);
+                // 尾部列自适应剩余宽度
+                int used = 0;
+                for (int ci = 0; ci < devLv.Columns.Count - 1; ci++) used += devLv.Columns[ci].Width;
+                int last = devLv.ClientSize.Width - used - 4;
+                devLv.Columns[devLv.Columns.Count - 1].Width = Math.Max(10, last);
+            };
+            rs.NewRow(102);
             devLv.DoubleClick += delegate { SetActiveSelected(); };
 
             rs.RowBegin(0);

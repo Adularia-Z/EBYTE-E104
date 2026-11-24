@@ -795,7 +795,11 @@ namespace E104
             public FlatBtn RowButton(string text, int width, BtnKind kind, string tip)
             {
                 FlatBtn b = new FlatBtn(text, kind);
-                b.Width = width; b.Height = 26;
+                // 按钮宽度至少容纳文字(实测宽度 + 内边距),避免文字被截断
+                int need = TextRenderer.MeasureText(text ?? "", Theme.F,
+                              Size.Empty, TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Width + 28;
+                b.Width = Math.Max(width, need);
+                b.Height = 26;
                 if (_cur != null) _cur.Add(b, 6);
                 if (!string.IsNullOrEmpty(tip)) DarkTips.Set(b, tip);
                 return b;
