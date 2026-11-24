@@ -1,0 +1,33 @@
+# 构建产物
+*.exe
+*.pdb
+*.dll
+*.obj
+*.cache
+bin/
+obj/
+
+# 编译中间文件
+*.TMP
+*.tmp
+__pycache__/
+*.pyc
+
+# 运行期生成
+crash.log
+layout_test.txt
+E104_log_*.txt
+E104-BT53_config_*.json
+
+# 截图(临时)
+shot_*.png
+pg_*.png
+rz_*.png
+v_*.png
+_deploy_check/
+
+# IDE
+.vs/
+*.user
+*.suo
+.vscode/
